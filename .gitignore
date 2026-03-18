@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated outputs
+*.pdf
+db/*.db
+
+# Large log files
+logs/DRILL-01/
+logs/test_log.txt
+logs/test_log.txt.robocopy
