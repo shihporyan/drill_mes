@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# OS
+.DS_Store
+
 # Generated outputs
 *.pdf
 db/*.db
