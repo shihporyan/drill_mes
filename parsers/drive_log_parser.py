@@ -45,6 +45,44 @@ logger = logging.getLogger(__name__)
 VALID_STATES = {"RUN", "RESET", "STOP"}
 WO_PATTERN = re.compile(r"^O(\d+)\.(B|T)$", re.IGNORECASE)
 
+# Max seconds to attribute from a single gap between consecutive rows.
+# Gaps within this limit are assumed to be the same state (firmware skip).
+# Gaps beyond this limit are capped to avoid over-attribution.
+GAP_CAP_SECONDS = 120
+
+
+def _init_hourly_bucket(counter):
+    """Create a new hourly aggregation bucket."""
+    return {
+        "run": 0,
+        "reset": 0,
+        "stop": 0,
+        "first_counter": counter,
+        "last_counter": counter,
+        "prev_counter": None,
+        "hole_count": 0,
+    }
+
+
+def _distribute_seconds(start_dt, total_seconds, state_lower, hourly):
+    """Distribute seconds across hour boundaries starting from start_dt.
+
+    When a time delta spans an hour boundary (e.g. 10:59:55 + 14s),
+    this splits the seconds correctly between the two hours.
+    """
+    remaining = total_seconds
+    current_dt = start_dt
+    while remaining > 0:
+        next_hour = current_dt.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+        to_boundary = (next_hour - current_dt).total_seconds()
+        attributed = min(remaining, to_boundary)
+        key = (current_dt.strftime("%Y-%m-%d"), current_dt.hour)
+        if key not in hourly:
+            hourly[key] = _init_hourly_bucket(None)
+        hourly[key][state_lower] += int(attributed)
+        remaining -= attributed
+        current_dt = next_hour
+
 
 def extract_work_order(program):
     """Extract work order and side from a production program name.
@@ -209,54 +247,95 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
             update_parse_progress(conn, machine_id, day_prefix, total_lines, None, file_size)
             return
 
-        # ---- Aggregate hourly data ----
-        # Group by (date, hour)
-        # Key: (date_str, hour) -> {run, reset, stop, first_counter, last_counter}
-        hourly = {}
-        for row in parsed_rows:
-            key = (row["date"], row["hour"])
-            if key not in hourly:
-                hourly[key] = {
-                    "run": 0,
-                    "reset": 0,
-                    "stop": 0,
-                    "first_counter": row["counter"],
-                    "last_counter": row["counter"],
-                    "prev_counter": None,
-                    "hole_count": 0,
-                }
-            bucket = hourly[key]
-            state_lower = row["state"].lower()
-            if state_lower in ("run", "reset", "stop"):
-                bucket[state_lower] += 1  # Each row = 1 second
+        # ---- Sort and deduplicate rows ----
+        # M13 firmware can insert out-of-order "peek-ahead" rows (~6 min
+        # into the future).  Sorting puts them in chronological position;
+        # dedup removes any duplicate timestamps that result.
+        for idx, row in enumerate(parsed_rows):
+            row["_file_order"] = idx
+        parsed_rows.sort(key=lambda r: (r["datetime"], r["_file_order"]))
 
-            # Hole count: track counter, detect resets
-            if bucket["prev_counter"] is not None:
-                delta = row["counter"] - bucket["prev_counter"]
-                if delta > 0:
-                    bucket["hole_count"] += delta
-                elif delta < 0:
-                    # Counter reset detected - start new counting period
-                    logger.debug("[%s] Counter reset at %s (from %d to %d)",
-                                 machine_id, row["iso_timestamp"],
-                                 bucket["prev_counter"], row["counter"])
-            bucket["prev_counter"] = row["counter"]
-            bucket["last_counter"] = row["counter"]
+        deduped = []
+        for i, row in enumerate(parsed_rows):
+            if (i + 1 < len(parsed_rows)
+                    and parsed_rows[i + 1]["datetime"] == row["datetime"]):
+                continue  # skip duplicate, keep the later file-order row
+            deduped.append(row)
+        parsed_rows = deduped
 
-        # If we're doing incremental parse and this is not the first run,
-        # we need to handle cross-boundary counter tracking.
-        # For simplicity in incremental mode, hole_count from first_counter
-        # to last_counter is used, but we track per-row deltas above.
-
-        # ---- Detect state transitions ----
-        transitions = []
-        # Get previous state from machine_current_state
+        # ---- Get previous state for incremental delta + transitions ----
         cursor = conn.execute(
             "SELECT state FROM machine_current_state WHERE machine_id=?",
             (machine_id,),
         )
         prev_state_row = cursor.fetchone()
         prev_state = prev_state_row[0] if prev_state_row else None
+
+        # ---- Aggregate hourly data (timestamp-delta based) ----
+        # Instead of counting rows (1 row = 1 second), we compute the
+        # actual time delta between consecutive rows and attribute it to
+        # the current row's state.  This handles firmware gaps correctly.
+        hourly = {}
+
+        # Incremental parse: bridge gap from previous batch's last row
+        if last_line > 0 and parsed_rows:
+            cursor = conn.execute(
+                "SELECT last_timestamp FROM parse_progress "
+                "WHERE machine_id=? AND day_prefix=?",
+                (machine_id, day_prefix),
+            )
+            progress = cursor.fetchone()
+            if progress and progress[0] and prev_state:
+                try:
+                    prev_dt = datetime.datetime.fromisoformat(progress[0])
+                    bridge_delta = (parsed_rows[0]["datetime"] - prev_dt).total_seconds()
+                    if 0 < bridge_delta <= GAP_CAP_SECONDS:
+                        _distribute_seconds(
+                            prev_dt, bridge_delta, prev_state.lower(), hourly)
+                except (ValueError, TypeError):
+                    pass
+
+        for i in range(len(parsed_rows)):
+            row = parsed_rows[i]
+            state_lower = row["state"].lower()
+            key = (row["date"], row["hour"])
+
+            # Ensure bucket exists (needed for hole-count tracking)
+            if key not in hourly:
+                hourly[key] = _init_hourly_bucket(row["counter"])
+            bucket = hourly[key]
+            if bucket["first_counter"] is None:
+                bucket["first_counter"] = row["counter"]
+
+            # --- Seconds: use delta to next row ---
+            if state_lower in ("run", "reset", "stop"):
+                if i + 1 < len(parsed_rows):
+                    delta = (parsed_rows[i + 1]["datetime"] - row["datetime"]).total_seconds()
+                    if delta > 0:
+                        _distribute_seconds(
+                            row["datetime"],
+                            min(delta, GAP_CAP_SECONDS),
+                            state_lower,
+                            hourly,
+                        )
+                    # delta <= 0 after sort+dedup should not happen; skip
+                else:
+                    bucket[state_lower] += 1  # last row: 1 second
+
+            # --- Hole count: unchanged (counter deltas) ---
+            if bucket["prev_counter"] is not None:
+                counter_delta = row["counter"] - bucket["prev_counter"]
+                if counter_delta > 0:
+                    bucket["hole_count"] += counter_delta
+                elif counter_delta < 0:
+                    logger.debug("[%s] Counter reset at %s (from %d to %d)",
+                                 machine_id, row["iso_timestamp"],
+                                 bucket["prev_counter"], row["counter"])
+            bucket["prev_counter"] = row["counter"]
+            bucket["last_counter"] = row["counter"]
+
+        # ---- Detect state transitions ----
+        transitions = []
 
         for row in parsed_rows:
             if prev_state is not None and row["state"] != prev_state:

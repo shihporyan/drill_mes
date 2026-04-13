@@ -23,33 +23,54 @@ from db.init_db import init_database
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
 
-# Golden data: hourly RUN/RESET/STOP seconds for M02 on 2026-03-17
+# Source data for synthetic log generation: what the machine actually logged.
+# Hours with total=0 produce no rows, creating gaps in the synthetic data.
+SOURCE_HOURLY = {
+    0:  {"run": 3103, "reset": 436,  "stop": 61,  "total": 3600},
+    7:  {"run": 274,  "reset": 3319, "stop": 7,   "total": 3600},
+    8:  {"run": 2302, "reset": 1284, "stop": 14,  "total": 3600},
+    9:  {"run": 2733, "reset": 860,  "stop": 7,   "total": 3600},
+    10: {"run": 3319, "reset": 257,  "stop": 24,  "total": 3600},
+    11: {"run": 1898, "reset": 1594, "stop": 108, "total": 3600},
+    12: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600},
+    13: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600},
+    14: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600},
+    15: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600},
+    16: {"run": 0,    "reset": 2797, "stop": 0,   "total": 2797},
+    17: {"run": 0,    "reset": 1303, "stop": 0,   "total": 1303},
+}
+
+# Golden data: expected parser output (timestamp-delta based counting).
+#
+# The parser attributes the time delta between consecutive rows to the
+# current row's state, capped at GAP_CAP_SECONDS (120).  When the synthetic
+# data has a gap between active blocks, the last row's state is attributed
+# up to the cap into the gap:
+#   - Hour 0 (ends 00:59:59) → Hour 7 (starts 07:00:00): 1s to hour 0,
+#     119s STOP spills into hour 1.
+#   - Hour 16 (ends 16:46:36) → Hour 17 (starts 17:00:00): 120s extra
+#     RESET attributed to hour 16.
 GOLDEN_HOURLY = {
-    0:  {"run": 3103, "reset": 436,  "stop": 61,  "total": 3600, "util": 86.2},
-    1:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    2:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    3:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    4:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    5:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    6:  {"run": 0,    "reset": 0,    "stop": 0,   "total": 0,    "util": 0.0},
-    7:  {"run": 274,  "reset": 3319, "stop": 7,   "total": 3600, "util": 7.6},
-    8:  {"run": 2302, "reset": 1284, "stop": 14,  "total": 3600, "util": 63.9},
-    9:  {"run": 2733, "reset": 860,  "stop": 7,   "total": 3600, "util": 75.9},
-    10: {"run": 3319, "reset": 257,  "stop": 24,  "total": 3600, "util": 92.2},
-    11: {"run": 1898, "reset": 1594, "stop": 108, "total": 3600, "util": 52.7},
-    12: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600, "util": 0.0},
-    13: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600, "util": 0.0},
-    14: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600, "util": 0.0},
-    15: {"run": 0,    "reset": 3600, "stop": 0,   "total": 3600, "util": 0.0},
-    16: {"run": 0,    "reset": 2797, "stop": 0,   "total": 2797, "util": 0.0},
-    17: {"run": 0,    "reset": 1303, "stop": 0,   "total": 1303, "util": 0.0},
+    0:  {"run": 3103, "reset": 436,  "stop": 61,   "total": 3600, "util": 86.2},
+    1:  {"run": 0,    "reset": 0,    "stop": 119,  "total": 119,  "util": 0.0},
+    7:  {"run": 274,  "reset": 3319, "stop": 7,    "total": 3600, "util": 7.6},
+    8:  {"run": 2302, "reset": 1284, "stop": 14,   "total": 3600, "util": 63.9},
+    9:  {"run": 2733, "reset": 860,  "stop": 7,    "total": 3600, "util": 75.9},
+    10: {"run": 3319, "reset": 257,  "stop": 24,   "total": 3600, "util": 92.2},
+    11: {"run": 1898, "reset": 1594, "stop": 108,  "total": 3600, "util": 52.7},
+    12: {"run": 0,    "reset": 3600, "stop": 0,    "total": 3600, "util": 0.0},
+    13: {"run": 0,    "reset": 3600, "stop": 0,    "total": 3600, "util": 0.0},
+    14: {"run": 0,    "reset": 3600, "stop": 0,    "total": 3600, "util": 0.0},
+    15: {"run": 0,    "reset": 3600, "stop": 0,    "total": 3600, "util": 0.0},
+    16: {"run": 0,    "reset": 2916, "stop": 0,    "total": 2916, "util": 0.0},
+    17: {"run": 0,    "reset": 1303, "stop": 0,    "total": 1303, "util": 0.0},
 }
 
 GOLDEN_DAILY_TOTAL = {
     "run": 13629,
-    "reset": 26250,
-    "stop": 221,
-    "total": 40100,
+    "reset": 26369,
+    "stop": 340,
+    "total": 40338,
 }
 
 GOLDEN_TRANSITION_COUNT = 63
@@ -130,7 +151,7 @@ class TestParserWithSyntheticData(unittest.TestCase):
         self.db_path = os.path.join(self.temp_dir, "test.db")
         init_database(self.db_path)
 
-        self.log_content = generate_synthetic_log(GOLDEN_HOURLY)
+        self.log_content = generate_synthetic_log(SOURCE_HOURLY)
         self.log_path = os.path.join(self.temp_dir, "17Drive.Log")
         with open(self.log_path, "w", encoding="utf-8") as f:
             f.write(self.log_content)
@@ -242,6 +263,170 @@ class TestParserWithSyntheticData(unittest.TestCase):
 
         self.assertIsNotNone(row, "machine_current_state should have M02 entry")
         self.assertIn(row[1], ("RUN", "RESET", "STOP"), "State should be valid")
+
+
+class TestParserWithGappedData(unittest.TestCase):
+    """Test that the parser correctly handles M13-style firmware gaps.
+
+    Simulates:
+    - 14-second gaps between rows (firmware skipping logging cycles)
+    - Time reversals (peek-ahead rows from ~6 minutes in the future)
+    - Cross-hour boundary gaps
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _generate_gapped_log(self):
+        """Generate log with 14-second gaps and a time reversal.
+
+        Pattern (hour 10, 10:00:00-10:59:59):
+        - 28 rows at 1s intervals (RUN), then 14s gap, repeat
+        - One peek-ahead row injected from ~6 min future
+        - Some RESET rows at end of hour
+
+        Expected: ~86 cycles of (28 rows + 14s gap) = ~86*42s = 3612s.
+        Each cycle covers 42 real seconds with 28 logged rows.
+        """
+        lines = []
+        counter = 50000000
+        date_str = "2026/04/10"
+
+        # Hour 10: RUN with 14s gaps, 28 rows per cycle
+        current_second = 10 * 3600  # 10:00:00
+        end_second = 10 * 3600 + 3000  # 10:50:00 → RUN
+        rows_in_cycle = 0
+
+        while current_second < end_second:
+            h = current_second // 3600
+            m = (current_second % 3600) // 60
+            s = current_second % 60
+            time_str = "{:02d}:{:02d}:{:02d}".format(h, m, s)
+            counter += 1
+            line = "{},{},AUTO,RUN,O100.txt,20.142,276.228,084,1.000,0000,{},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000".format(
+                date_str, time_str, counter)
+            lines.append(line)
+            rows_in_cycle += 1
+            current_second += 1
+
+            if rows_in_cycle >= 28:
+                current_second += 14  # firmware gap
+                rows_in_cycle = 0
+
+        # Inject a peek-ahead row (from ~6 min in the future, then normal resumes)
+        # This simulates the M13 firmware bug: one row from the future inserted
+        # between normal rows
+        future_second = current_second + 355
+        h = future_second // 3600
+        m = (future_second % 3600) // 60
+        s = future_second % 60
+        peek_time = "{:02d}:{:02d}:{:02d}".format(h, m, s)
+        counter_peek = counter + 120
+        lines.append("{},{},AUTO,RUN,O100.txt,20.142,276.228,084,1.000,0000,{},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000".format(
+            date_str, peek_time, counter_peek))
+
+        # Continue normal rows after the peek (RESET for remaining time)
+        reset_start = current_second
+        reset_end = 10 * 3600 + 3600  # 11:00:00
+        while reset_start < reset_end:
+            h = reset_start // 3600
+            m = (reset_start % 3600) // 60
+            s = reset_start % 60
+            time_str = "{:02d}:{:02d}:{:02d}".format(h, m, s)
+            line = "{},{},MAN,RESET,,20.142,276.228,000,0.150,0000,{},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000".format(
+                date_str, time_str, counter)
+            lines.append(line)
+            reset_start += 1
+
+        return "\n".join(lines) + "\n"
+
+    def test_gap_seconds_attribution(self):
+        """Verify that 14-second gaps are attributed to the correct state."""
+        content = self._generate_gapped_log()
+        log_path = os.path.join(self.temp_dir, "10Drive.Log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        parse_log_file(self.db_path, "M13", log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT run_seconds, reset_seconds, stop_seconds, total_seconds "
+                "FROM hourly_utilization WHERE machine_id='M13' AND hour=10"
+            )
+            row = cursor.fetchone()
+
+        self.assertIsNotNone(row, "Should have data for hour 10")
+        run, reset, stop, total = row
+
+        # With gaps properly attributed, total should be close to 3600
+        # (not just the row count, which would be much less)
+        self.assertGreater(total, 3500,
+                           "Total should be close to 3600, got {} "
+                           "(gaps were not attributed)".format(total))
+        self.assertLessEqual(total, 3600,
+                             "Total should not exceed 3600, got {}".format(total))
+
+        # RUN should account for most of the hour (we put RUN in first 50 min)
+        self.assertGreater(run, 2800,
+                           "RUN should include gap time, got {}".format(run))
+
+    def test_time_reversal_handling(self):
+        """Verify that time reversals (peek-ahead rows) don't corrupt data."""
+        content = self._generate_gapped_log()
+        log_path = os.path.join(self.temp_dir, "10Drive.Log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        parse_log_file(self.db_path, "M13", log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT total_seconds FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            )
+            total = cursor.fetchone()[0]
+
+        # The peek-ahead row should be sorted into its correct chronological
+        # position and not create a negative-time artifact
+        self.assertGreater(total, 0, "Total should be positive despite reversal")
+
+    def test_cross_hour_gap_split(self):
+        """Verify that a gap spanning an hour boundary splits correctly."""
+        # Generate simple data: one row at 10:59:55 (RUN) and one at 11:00:09 (RUN)
+        date_str = "2026/04/10"
+        lines = [
+            "{},10:59:55,AUTO,RUN,O100.txt,20.142,276.228,084,1.000,0000,100,1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000".format(date_str),
+            "{},11:00:09,AUTO,RUN,O100.txt,20.142,276.228,084,1.000,0000,101,1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000".format(date_str),
+        ]
+        log_path = os.path.join(self.temp_dir, "10Drive.Log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        parse_log_file(self.db_path, "M13", log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            rows = {}
+            cursor = conn.execute(
+                "SELECT hour, run_seconds FROM hourly_utilization "
+                "WHERE machine_id='M13' ORDER BY hour"
+            )
+            for r in cursor:
+                rows[r[0]] = r[1]
+
+        # 14s gap: 5s should go to hour 10 (10:59:55 to 11:00:00)
+        # and 9s to hour 11 (11:00:00 to 11:00:09)
+        self.assertEqual(rows.get(10, 0), 5,
+                         "Hour 10 should get 5 seconds (to boundary)")
+        # Hour 11: 9s from gap + 1s for last row = 10
+        self.assertEqual(rows.get(11, 0), 10,
+                         "Hour 11 should get 9s (from gap) + 1s (last row)")
 
 
 class TestParserWithFixture(unittest.TestCase):
