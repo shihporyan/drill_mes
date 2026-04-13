@@ -28,6 +28,7 @@ from parsers.base_parser import (
     get_db_path,
 )
 from parsers.drive_log_parser import parse_log_file
+from parsers.tx1_log_parser import parse_tx1_file
 from parsers.laser_log_parser import parse_laser_machine
 
 logger = logging.getLogger("backfill")
@@ -102,6 +103,16 @@ def _backfill_takeuchi(db_path, machine_id, machine_dir, target_date):
                 parsed += 1
             except Exception as e:
                 logger.error("[%s] Error parsing %s: %s", machine_id, filename, e, exc_info=True)
+
+            # Also parse TX1.Log for work order tracking
+            tx1_filename = "{}TX1.Log".format(day_prefix)
+            tx1_path = os.path.join(date_path, tx1_filename)
+            if os.path.exists(tx1_path):
+                try:
+                    logger.info("[%s] Parsing %s/%s", machine_id, date_dir, tx1_filename)
+                    parse_tx1_file(db_path, machine_id, tx1_path, day_prefix)
+                except Exception as e:
+                    logger.error("[%s] Error parsing %s: %s", machine_id, tx1_filename, e, exc_info=True)
 
     return parsed
 

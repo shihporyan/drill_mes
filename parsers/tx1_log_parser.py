@@ -1,0 +1,192 @@
+"""
+Takeuchi TX1.Log parser — work order tracking via FILEOPERATION LOAD events.
+
+TX1.Log is CP932 encoded and contains operator actions. The key event:
+    YYYY/MM/DD HH:MM:SS.mmm OpeLog : FILEOPERATION SCREEN:[PROGRAMLIST] OPERATION:[LOAD] NAME:[O2604031.B]
+
+Work order inference: the last production program loaded (matching O/GR pattern)
+is the active work order. O100.txt loads are ignored (main program, not a WO).
+
+Updates machine_current_state.work_order and work_order_side only.
+Does not touch state/mode/program/counter (managed by Drive.Log parser).
+
+Supports incremental parsing via parse_progress table with key "tx1_{day_prefix}".
+"""
+
+import datetime
+import logging
+import os
+import re
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from parsers.base_parser import (
+    load_machines_config,
+    load_settings,
+    get_machines_by_type,
+    get_backup_root,
+    get_db_path,
+    get_db_connection,
+    check_file_overwrite,
+    get_parse_progress,
+    update_parse_progress,
+)
+from parsers.drive_log_parser import extract_work_order
+
+logger = logging.getLogger(__name__)
+
+FILEOPERATION_LOAD_PATTERN = re.compile(
+    r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})"
+    r".*FILEOPERATION.*OPERATION:\[LOAD\] NAME:\[(.+?)\]"
+)
+
+
+def parse_fileoperation_line(line):
+    """Extract timestamp and program name from a FILEOPERATION LOAD line.
+
+    Args:
+        line: Raw text line from TX1.Log.
+
+    Returns:
+        dict with 'timestamp' (ISO str) and 'program_name', or None.
+    """
+    m = FILEOPERATION_LOAD_PATTERN.match(line)
+    if not m:
+        return None
+    ts_raw = m.group(1)
+    # Convert '2026/04/10 21:39:48.796' to '2026-04-10T21:39:48.796'
+    iso_ts = ts_raw.replace("/", "-", 2).replace(" ", "T", 1)
+    program_name = m.group(2).strip()
+    return {"timestamp": iso_ts, "program_name": program_name}
+
+
+def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
+    """Parse TX1.Log incrementally and update work order in machine_current_state.
+
+    Args:
+        db_path: Path to SQLite database.
+        machine_id: Machine identifier (e.g. 'M13').
+        log_path: Full path to the TX1.Log file.
+        day_prefix: Two-digit day string (e.g. '10').
+    """
+    if not os.path.exists(log_path):
+        return
+
+    file_size = os.path.getsize(log_path)
+    if file_size == 0:
+        return
+
+    progress_key = "tx1_{}".format(day_prefix)
+    conn = get_db_connection(db_path)
+    try:
+        # Check for file overwrite (monthly cycle)
+        overwritten = check_file_overwrite(conn, machine_id, progress_key, file_size)
+
+        last_line, _ = get_parse_progress(conn, machine_id, progress_key)
+
+        # Read file with CP932 encoding
+        with open(log_path, "r", encoding="cp932", errors="replace") as f:
+            all_lines = f.readlines()
+
+        total_lines = len(all_lines)
+        if last_line >= total_lines and not overwritten:
+            return  # Nothing new to parse
+
+        new_lines = all_lines[last_line:]
+        if not new_lines:
+            return
+
+        # Extract FILEOPERATION LOAD events
+        events = []
+        for line in new_lines:
+            event = parse_fileoperation_line(line.strip())
+            if event:
+                events.append(event)
+
+        # Find last production program in new events
+        last_wo = None
+        last_side = None
+        last_ts = None
+        for event in events:
+            wo, side = extract_work_order(event["program_name"])
+            if wo:
+                last_wo = wo
+                last_side = side
+                last_ts = event["timestamp"]
+
+        # Update machine_current_state with work order (targeted UPDATE only)
+        if last_wo is not None:
+            conn.execute(
+                "UPDATE machine_current_state SET work_order=?, work_order_side=? "
+                "WHERE machine_id=?",
+                (last_wo, last_side, machine_id),
+            )
+            conn.commit()
+            logger.info("[%s] TX1 work order: %s.%s (at %s)", machine_id, last_wo, last_side, last_ts)
+
+        # Update parse progress
+        last_event_ts = last_ts
+        if not last_event_ts and events:
+            last_event_ts = events[-1]["timestamp"]
+        update_parse_progress(conn, machine_id, progress_key, total_lines, last_event_ts, file_size)
+
+    finally:
+        conn.close()
+
+
+def get_tx1_log_path(settings, machine_id, day_prefix):
+    """Build the local TX1.Log file path.
+
+    Args:
+        settings: Settings dict with backup_root.
+        machine_id: Machine identifier.
+        day_prefix: Two-digit day string.
+
+    Returns:
+        str: Full path to the TX1.Log file.
+    """
+    today = datetime.date.today()
+    date_dir = today.strftime("%Y%m%d")
+    return os.path.join(
+        get_backup_root(settings), machine_id, date_dir,
+        "{}TX1.Log".format(day_prefix),
+    )
+
+
+def run_parser_cycle(db_path=None, settings=None, machines_config=None):
+    """Execute one TX1.Log parse cycle for all enabled Takeuchi machines.
+
+    Args:
+        db_path: Optional database path override.
+        settings: Optional settings dict override.
+        machines_config: Optional machines config override.
+    """
+    if settings is None:
+        settings = load_settings()
+    if machines_config is None:
+        machines_config = load_machines_config()
+    if db_path is None:
+        db_path = get_db_path(settings)
+
+    takeuchi_machines = get_machines_by_type(machines_config, "takeuchi")
+    if not takeuchi_machines:
+        return
+
+    today = datetime.date.today()
+    day_prefix = today.strftime("%d")
+
+    logger.info("TX1 parser cycle start: %d Takeuchi machines, day_prefix=%s",
+                len(takeuchi_machines), day_prefix)
+
+    for machine in takeuchi_machines:
+        machine_id = machine["id"]
+        log_path = get_tx1_log_path(settings, machine_id, day_prefix)
+
+        try:
+            parse_tx1_file(db_path, machine_id, log_path, day_prefix)
+        except Exception as e:
+            logger.error("[%s] TX1 parser error: %s", machine_id, e, exc_info=True)
+
+    logger.info("TX1 parser cycle complete.")

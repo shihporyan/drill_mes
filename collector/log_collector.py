@@ -107,9 +107,9 @@ def collect_logs_for_machine(machine, settings):
     # Ensure destination directory exists
     os.makedirs(dest, exist_ok=True)
 
-    # robocopy with retry=1, wait=1sec, only *Drive.Log files
+    # robocopy with retry=1, wait=1sec, copy Drive.Log and TX1.Log
     cmd = [
-        "robocopy", source, dest, "*Drive.Log",
+        "robocopy", source, dest, "*Drive.Log", "*TX1.Log",
         "/R:1", "/W:1",
     ]
 

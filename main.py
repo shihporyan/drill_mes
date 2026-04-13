@@ -31,6 +31,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from db.init_db import init_database
 from parsers.base_parser import load_settings, load_machines_config, get_db_path
 from parsers.drive_log_parser import run_parser_cycle, run_parser_loop
+from parsers.tx1_log_parser import run_parser_cycle as run_tx1_parser_cycle
 from parsers.laser_log_parser import run_parser_cycle as run_laser_parser_cycle
 from collector.log_collector import run_collection_cycle, run_collection_loop
 from collector.laser_log_collector import run_collection_cycle as run_laser_collection_cycle
@@ -109,6 +110,13 @@ def run_collect_and_parse_loop(settings, machines_config, db_path):
             logger.error("Parser failed: %s", e, exc_info=True)
 
         try:
+            # Step 2a: Parse TX1.Log for work order tracking
+            logger.info("--- TX1 parser cycle ---")
+            run_tx1_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
+        except Exception as e:
+            logger.error("TX1 parser failed: %s", e, exc_info=True)
+
+        try:
             # Step 2b: Parse collected logs (laser)
             logger.info("--- Laser parser cycle ---")
             run_laser_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
@@ -155,8 +163,9 @@ def run_once():
     run_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
     run_laser_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
 
-    # Parse (mechanical + laser)
+    # Parse (mechanical + TX1 work order + laser)
     run_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
+    run_tx1_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
     run_laser_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
 
     # Cleanup

@@ -1,10 +1,13 @@
 """
 Set up mock dev_logs directory from original_logs/machine_logs.
 
-Copies *Drive.Log files into the directory structure expected by the parser:
+Copies *Drive.Log, *TX1.Log, and *FILE.Log files into the directory
+structure expected by the parsers:
     dev_logs/{machine_id}/{YYYYMMDD}/{DD}Drive.Log
+    dev_logs/{machine_id}/{YYYYMMDD}/{DD}TX1.Log
+    dev_logs/{machine_id}/{YYYYMMDD}/{DD}FILE.Log
 
-Re-runnable (idempotent). Only copies Drive.Log files.
+Re-runnable (idempotent).
 
 Usage:
     python tools/setup_dev_logs.py
@@ -67,8 +70,11 @@ def get_date_from_log(filepath, day_prefix):
     return None
 
 
+COMPANION_SUFFIXES = ["TX1.Log", "FILE.Log"]
+
+
 def setup_dev_logs():
-    """Copy Drive.Log files into mock directory structure."""
+    """Copy Drive.Log (and companion TX1.Log, FILE.Log) into mock directory structure."""
     if not os.path.isdir(SOURCE_DIR):
         print("ERROR: Source directory not found: {}".format(SOURCE_DIR))
         return
@@ -108,21 +114,28 @@ def setup_dev_logs():
                 continue
 
             dst_dir = os.path.join(DEV_LOGS_DIR, machine_id, date_dir)
-            dst_file = os.path.join(dst_dir, filename)
-
             os.makedirs(dst_dir, exist_ok=True)
 
-            # Check if already copied and same size
-            if os.path.exists(dst_file):
-                if os.path.getsize(dst_file) == os.path.getsize(src_file):
-                    print("  EXISTS: {} -> {}/{}".format(filename, date_dir, filename))
+            # Copy Drive.Log and companion files (TX1.Log, FILE.Log)
+            files_to_copy = [filename]
+            for suffix in COMPANION_SUFFIXES:
+                companion = "{}{}".format(day_prefix, suffix)
+                if os.path.exists(os.path.join(src_path, companion)):
+                    files_to_copy.append(companion)
+
+            for fname in files_to_copy:
+                src = os.path.join(src_path, fname)
+                dst = os.path.join(dst_dir, fname)
+
+                if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                    print("  EXISTS: {} -> {}/{}".format(fname, date_dir, fname))
                     skipped += 1
                     continue
 
-            shutil.copy2(src_file, dst_file)
-            size_mb = os.path.getsize(dst_file) / (1024 * 1024)
-            print("  COPY: {} -> {}/{} ({:.1f} MB)".format(filename, date_dir, filename, size_mb))
-            copied += 1
+                shutil.copy2(src, dst)
+                size_mb = os.path.getsize(dst) / (1024 * 1024)
+                print("  COPY: {} -> {}/{} ({:.1f} MB)".format(fname, date_dir, fname, size_mb))
+                copied += 1
 
     print()
     print("Done: {} files copied, {} skipped (already exist)".format(copied, skipped))

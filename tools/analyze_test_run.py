@@ -351,14 +351,15 @@ def report_work_details(machine_id, all_rows):
 
     # 4b. Work order suffix analysis (板號)
     import re
-    wo_pattern = re.compile(r"^O(\d+)\.(\w+)$", re.IGNORECASE)
+    wo_pattern = re.compile(r"^(O|GR)(\d+)\.(\w+)$", re.IGNORECASE)
     wo_suffixes = Counter()
     wo_names = Counter()
     for r in all_rows:
         m = wo_pattern.match(r["program"])
         if m:
-            wo_names[m.group(1)] += 1
-            wo_suffixes[m.group(2).upper()] += 1
+            prefix = m.group(1).upper()
+            wo_names["{}{}".format(prefix, m.group(2))] += 1
+            wo_suffixes[m.group(3).upper()] += 1
 
     if wo_suffixes:
         print("  工號後綴分佈:")
@@ -367,9 +368,9 @@ def report_work_details(machine_id, all_rows):
         print()
         print("  不重複工號:")
         for wo, count in wo_names.most_common():
-            print("    O{}  {:>10,d} 列".format(wo, count))
+            print("    {}  {:>10,d} 列".format(wo, count))
     else:
-        print("  未偵測到符合 O####.X 格式的生產程式")
+        print("  未偵測到符合 O####.X / GR####.X 格式的生產程式")
     print()
 
     # 4c. Drill diameter (針徑)

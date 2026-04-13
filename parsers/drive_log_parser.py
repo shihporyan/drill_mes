@@ -43,7 +43,7 @@ from parsers.base_parser import (
 logger = logging.getLogger(__name__)
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
-WO_PATTERN = re.compile(r"^O(\d+)\.(B|T)$", re.IGNORECASE)
+WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)$", re.IGNORECASE)
 
 # Max seconds to attribute from a single gap between consecutive rows.
 # Gaps within this limit are assumed to be the same state (firmware skip).
@@ -88,7 +88,7 @@ def extract_work_order(program):
     """Extract work order and side from a production program name.
 
     Args:
-        program: Program name from Drive.Log (e.g. 'O2604016.B').
+        program: Program name from Drive.Log (e.g. 'O2604016.B', 'GR2604003.T').
 
     Returns:
         tuple: (work_order, side) e.g. ('O2604016', 'B'), or (None, None).
@@ -97,7 +97,8 @@ def extract_work_order(program):
         return None, None
     m = WO_PATTERN.match(program.strip())
     if m:
-        return "O{}".format(m.group(1)), m.group(2).upper()
+        prefix = m.group(1).upper()
+        return "{}{}".format(prefix, m.group(2)), m.group(3).upper()
     return None, None
 
 
