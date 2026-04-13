@@ -783,6 +783,13 @@ function Dashboard() {
     try {
       const data = await fetchOverview();
       setOverviewData(data);
+      // Align countdown with backend cycle (clock-skew safe)
+      if (data && data.next_cycle_at && data.timestamp) {
+        const serverNow = new Date(data.timestamp).getTime();
+        const nextCycle = new Date(data.next_cycle_at).getTime();
+        const remaining = Math.floor((nextCycle - serverNow) / 1000);
+        if (remaining > 0) setCd(remaining);
+      }
       // Check if we got real API data by trying the fetch directly
       try {
         await apiFetch("/api/drilling/overview");

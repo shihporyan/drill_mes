@@ -137,6 +137,19 @@ def _run_migrations(db_path):
             )
             logger.info("Migration: created laser_work_orders table")
 
+        # Ensure system_status table exists (for frontend cycle sync)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='system_status'"
+        )
+        if not cursor.fetchone():
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS system_status (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            logger.info("Migration: created system_status table")
+
         # Convert WD- prefix to O prefix for Takeuchi work orders
         updated = conn.execute(
             "UPDATE machine_current_state SET work_order = 'O' || SUBSTR(work_order, 4) "

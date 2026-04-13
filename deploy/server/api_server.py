@@ -185,6 +185,18 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
             cursor = conn.execute("SELECT * FROM machine_health")
             health_rows = {r["machine_id"]: dict(r) for r in cursor.fetchall()}
 
+            # Get next cycle time for frontend sync
+            next_cycle_at = None
+            try:
+                cursor = conn.execute(
+                    "SELECT value FROM system_status WHERE key='next_cycle_at'"
+                )
+                row = cursor.fetchone()
+                if row:
+                    next_cycle_at = row[0]
+            except Exception:
+                pass
+
         # Build machine list
         machines = []
         summary = {"running": 0, "idle": 0, "stopped": 0, "offline": 0, "total": len(all_machines)}
@@ -281,6 +293,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
 
         self._send_json({
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S"),
+            "next_cycle_at": next_cycle_at,
             "machines": machines,
             "summary": summary,
             "health": health,

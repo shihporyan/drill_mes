@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS laser_work_orders (
     UNIQUE(machine_id, start_time, station)
 );
 
+-- System key-value store (e.g. next_cycle_at for frontend sync)
+CREATE TABLE IF NOT EXISTS system_status (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- ===== Indexes =====
 CREATE INDEX IF NOT EXISTS idx_hourly_date ON hourly_utilization(date);
 CREATE INDEX IF NOT EXISTS idx_transitions_ts ON state_transitions(machine_id, timestamp);

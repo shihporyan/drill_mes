@@ -16,8 +16,10 @@ Usage:
     python main.py --server-only  # Start only the API server
 """
 
+import datetime
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -109,6 +111,17 @@ def run_collect_and_parse_loop(settings, machines_config, db_path):
             cleanup_old_backups(dry_run=False, settings=settings)
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
+
+        # Write next_cycle_at so frontend can align its countdown
+        next_at = (datetime.datetime.now() + datetime.timedelta(seconds=interval)).isoformat()
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO system_status(key, value) VALUES(?, ?)",
+                    ("next_cycle_at", next_at),
+                )
+        except Exception as e:
+            logger.warning("Failed to write next_cycle_at: %s", e)
 
         logger.info("Next cycle in %d seconds...", interval)
         time.sleep(interval)
