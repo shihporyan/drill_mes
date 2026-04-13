@@ -19,6 +19,7 @@ import datetime
 import io
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -30,6 +31,7 @@ from parsers.base_parser import (
     load_machines_config,
     load_settings,
     get_enabled_machines,
+    get_backup_root,
     get_db_path,
     get_db_connection,
     check_file_overwrite,
@@ -41,6 +43,24 @@ from parsers.base_parser import (
 logger = logging.getLogger(__name__)
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
+WO_PATTERN = re.compile(r"^O(\d+)\.(B|T)$", re.IGNORECASE)
+
+
+def extract_work_order(program):
+    """Extract work order and side from a production program name.
+
+    Args:
+        program: Program name from Drive.Log (e.g. 'O2604016.B').
+
+    Returns:
+        tuple: (work_order, side) e.g. ('O2604016', 'B'), or (None, None).
+    """
+    if not program:
+        return None, None
+    m = WO_PATTERN.match(program.strip())
+    if m:
+        return "O{}".format(m.group(1)), m.group(2).upper()
+    return None, None
 
 
 def parse_csv_line(line):
@@ -251,6 +271,26 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                 })
             prev_state = row["state"]
 
+        # ---- Track last production program for work order ----
+        last_wo = None
+        last_wo_side = None
+        for row in parsed_rows:
+            wo, side = extract_work_order(row["program"])
+            if wo:
+                last_wo = wo
+                last_wo_side = side
+
+        # If no production program found in this batch, keep existing WO
+        if last_wo is None:
+            cursor = conn.execute(
+                "SELECT work_order, work_order_side FROM machine_current_state WHERE machine_id=?",
+                (machine_id,),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                last_wo = existing[0]
+                last_wo_side = existing[1]
+
         # ---- Write to database ----
 
         # If file was overwritten, clear old data for affected dates
@@ -310,20 +350,34 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                     since = parsed_rows[i + 1]["iso_timestamp"]
                 break
         else:
-            # All rows have same state, use first row
-            since = parsed_rows[0]["iso_timestamp"]
+            # All rows in batch have same state — check if state unchanged from DB
+            if prev_state == last_row["state"]:
+                cursor = conn.execute(
+                    "SELECT since FROM machine_current_state WHERE machine_id=?",
+                    (machine_id,),
+                )
+                existing_since = cursor.fetchone()
+                if existing_since and existing_since[0]:
+                    since = existing_since[0]
+                else:
+                    since = parsed_rows[0]["iso_timestamp"]
+            else:
+                since = parsed_rows[0]["iso_timestamp"]
 
         conn.execute(
             "INSERT INTO machine_current_state "
-            "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter, "
+            "work_order, work_order_side) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(machine_id) DO UPDATE SET "
             "state=excluded.state, mode=excluded.mode, program=excluded.program, "
             "tool_num=excluded.tool_num, drill_dia=excluded.drill_dia, "
-            "since=excluded.since, last_update=excluded.last_update, counter=excluded.counter",
+            "since=excluded.since, last_update=excluded.last_update, counter=excluded.counter, "
+            "work_order=excluded.work_order, work_order_side=excluded.work_order_side",
             (machine_id, last_row["state"], last_row["mode"], last_row["program"],
              last_row["tool_num"], last_row["drill_dia"], since,
-             last_row["iso_timestamp"], last_row["counter"]),
+             last_row["iso_timestamp"], last_row["counter"],
+             last_wo, last_wo_side),
         )
 
         # Update parse progress
@@ -354,7 +408,7 @@ def get_log_path(settings, machine_id, day_prefix):
     today = datetime.date.today()
     date_dir = today.strftime("%Y%m%d")
     return os.path.join(
-        settings["backup_root"], machine_id, date_dir,
+        get_backup_root(settings), machine_id, date_dir,
         "{}Drive.Log".format(day_prefix),
     )
 
