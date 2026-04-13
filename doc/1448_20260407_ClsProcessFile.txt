@@ -1,3 +1,0 @@
-﻿2026/04/07 10:23:14:609 : エラー    AnalyzeProcessHeader-->   O番号が重複しています。加工ファイルファイルパス：C:\Users\KATAOKA\Desktop\WD-2604008\WD-2604008-TOP-A.lsr4行目項目：O番号
-2026/04/07 10:27:48:478 : エラー    AnalyzeProcessHeader-->   O番号が重複しています。加工ファイルファイルパス：C:\Users\KATAOKA\Desktop\WD-2604008\WD-2604008-TOP-A.lsr4行目項目：O番号
-2026/04/07 10:28:02:368 : エラー    AnalyzeFile-->   加工データのヘッダと詳細の数が不一致です。加工ファイルファイルパス：C:\Users\KATAOKA\Desktop\WD-2604008\WD-2604008-TOP-G.LSR項目：O番号:2000

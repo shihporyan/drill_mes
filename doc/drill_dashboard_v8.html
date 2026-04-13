@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>鑽孔機稼動監控看板</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Noto Sans TC','Helvetica Neue','Microsoft JhengHei',sans-serif;background:#f6f7f9;}
+button{font-family:inherit;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect}=React;
+
+// ============ CONFIG ============
+const TARGET=75;
+const DRILL_COLOR="#059669";  // green for mechanical drill
+const LASER_COLOR="#6366f1";  // indigo for laser drill
+
+// ============ DATA ============
+const DRILL_STATES=["RUN","RUN","RUN","RUN","RUN","RUN","RUN","RUN","IDLE","IDLE","STOP","STOP","MAINT"];
+const LASER_STATES=["RUN","RUN","IDLE","STOP"];
+const WO=["WO-2026-0341","WO-2026-0342","WO-2026-0338","WO-2026-0345","WO-2026-0350","WO-2026-0355","WO-2026-0360","WO-2026-0348"];
+const BOARDS=["PCB-A1020","PCB-B2150","PCB-C3080","PCB-D4010","PCB-E5060","PCB-F6020","PCB-G7090","PCB-H8010"];
+const DS=[30,40,50,60,80];
+
+function gen24h(state,isLaser){
+  return Array.from({length:24},function(_,h){
+    if(state==="STOP"||state==="MAINT") return {hour:h,util:Math.floor(Math.random()*10)};
+    if(state==="IDLE") return {hour:h,util:h>=8&&h<20?20+Math.floor(Math.random()*30):Math.floor(Math.random()*15)};
+    if(isLaser){
+      if(h>=8&&h<20) return {hour:h,util:25+Math.floor(Math.random()*50)};
+      return {hour:h,util:5+Math.floor(Math.random()*30)};
+    }
+    if(h>=8&&h<20) return {hour:h,util:55+Math.floor(Math.random()*45)};
+    if(h>=20||h<2) return {hour:h,util:30+Math.floor(Math.random()*50)};
+    return {hour:h,util:10+Math.floor(Math.random()*40)};
+  });
+}
+
+function makeMachine(i,state,type){
+  var id=String(i+1).padStart(2,"0");
+  var prefix=type==="drill"?"DRILL":"LASER";
+  var isLaser=type==="laser";
+  var dur=state==="RUN"?10+Math.floor(Math.random()*180):state==="IDLE"?3+Math.floor(Math.random()*45):5+Math.floor(Math.random()*120);
+  var uD=state==="RUN"?(isLaser?35+Math.floor(Math.random()*30):65+Math.floor(Math.random()*25)):state==="IDLE"?(isLaser?15+Math.floor(Math.random()*15):30+Math.floor(Math.random()*20)):Math.floor(Math.random()*15);
+  var uW=Math.min(99,uD+Math.floor(Math.random()*10)-5);
+  var uM=Math.min(99,uW+Math.floor(Math.random()*8)-3);
+  var hD=state==="RUN"?(isLaser?3000+Math.floor(Math.random()*5000):8000+Math.floor(Math.random()*12000)):state==="IDLE"?(isLaser?500+Math.floor(Math.random()*1500):2000+Math.floor(Math.random()*3000)):Math.floor(Math.random()*1000);
+  var tH=400+Math.floor(Math.random()*800),dH=Math.floor(tH*(0.15+Math.random()*0.7));
+  return {
+    id:prefix+"-"+id,type:type,state:state,dur:dur,timeline:gen24h(state,isLaser),
+    util:{day:uD,week:uW,month:uM},
+    holes:{day:hD,week:hD*6,month:hD*24},
+    detail:state==="RUN"?{
+      wo:WO[i%WO.length],board:BOARDS[i%BOARDS.length],
+      panel:""+(Math.floor(Math.random()*3)+1)+"/4",
+      drill:DS[i%DS.length],totalH:tH,doneH:dH,
+      eta:5+Math.floor(Math.random()*40),
+    }:null,
+  };
+}
+
+var DRILL_MACHINES=DRILL_STATES.map(function(s,i){return makeMachine(i,s,"drill");});
+var LASER_MACHINES=LASER_STATES.map(function(s,i){return makeMachine(i,s,"laser");});
+var ALL_MACHINES=DRILL_MACHINES.concat(LASER_MACHINES);
+
+// Trend mock data
+function genTrendData(baseRange,isLaser){
+  var MONTH_NAMES=["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+  var months=MONTH_NAMES.map(function(name,i){
+    var base=isLaser?25+Math.floor(Math.random()*25):55+Math.floor(Math.random()*20);
+    var holes=isLaser?30000+Math.floor(Math.random()*50000):100000+Math.floor(Math.random()*200000);
+    return {label:name,month:i+1,util:i<=2?base:null,holes:i<=2?holes:null,isCurrent:i===2};
+  });
+  var weeks={};
+  for(var m=1;m<=3;m++){
+    weeks[m]=Array.from({length:m===2?4:m===3?4:5},function(_,w){
+      var u=isLaser?20+Math.floor(Math.random()*35):50+Math.floor(Math.random()*35);
+      return {label:"W"+(w+1),week:w+1,util:u,holes:isLaser?5000+Math.floor(Math.random()*15000):20000+Math.floor(Math.random()*60000),isCurrent:m===3&&w===3};
+    });
+  }
+  var days={};
+  for(var m=1;m<=3;m++){
+    days[m]={};
+    var wc=m===2?4:m===3?4:5;
+    for(var w=1;w<=wc;w++){
+      days[m][w]=["一","二","三","四","五","六","日"].map(function(d,di){
+        var u=isLaser?(di>=5?5+Math.floor(Math.random()*20):20+Math.floor(Math.random()*35)):(di>=5?20+Math.floor(Math.random()*30):50+Math.floor(Math.random()*40));
+        return {label:d,util:u,holes:isLaser?1000+Math.floor(Math.random()*5000):5000+Math.floor(Math.random()*15000),isCurrent:m===3&&w===4&&di===3};
+      });
+    }
+  }
+  return {months:months,weeks:weeks,days:days};
+}
+var DRILL_TREND=genTrendData([55,75],false);
+var LASER_TREND=genTrendData([25,50],true);
+
+var SC={
+  RUN:{label:"稼動中",bg:"#059669"},
+  IDLE:{label:"閒置",bg:"#d97706"},
+  STOP:{label:"停機",bg:"#dc2626"},
+  MAINT:{label:"維護中",bg:"#7c3aed"},
+};
+var fmt=function(n){return n?n.toLocaleString():"—";};
+var durStr=function(m){return m>=60?Math.floor(m/60)+"h "+m%60+"m":m+" min";};
+
+// ============ HEADER ============
+function Header(props){
+  var tab=props.tab,setTab=props.setTab,countdown=props.countdown;
+  var cm=Math.floor(countdown/60),cs=String(countdown%60).padStart(2,"0");
+  var tabs=[
+    {key:"overview",label:"機台總覽"},
+    {key:"ranking",label:"稼動排行"},
+    {key:"analysis",label:"稼動分析"},
+    {key:"detail",label:"作業細節"},
+  ];
+  return (
+    <div style={{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"0 28px",position:"sticky",top:0,zIndex:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0 0"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:6,height:28,borderRadius:3,background:"linear-gradient(180deg,#059669,#6366f1)"}}/>
+          <div>
+            <h1 style={{margin:0,fontSize:20,fontWeight:700,color:"#111827"}}>鑽孔機稼動監控</h1>
+            <p style={{margin:0,fontSize:11,color:"#9ca3af"}}>13 台機鑽 + 4 台雷鑽 ｜ 每 10 分鐘同步</p>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",background:"#f0fdf4",borderRadius:6,border:"1px solid #bbf7d0"}}>
+          <div style={{width:6,height:6,borderRadius:"50%",background:"#22c55e",animation:"pulse 2s infinite"}}/>
+          <span style={{fontSize:11,color:"#059669",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{cm}:{cs} 後更新</span>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:0,marginTop:12}}>
+        {tabs.map(function(t){return (
+          <button key={t.key} onClick={function(){setTab(t.key);}} style={{
+            padding:"8px 20px 10px",border:"none",background:"transparent",cursor:"pointer",
+            borderBottom:tab===t.key?"2.5px solid #111827":"2.5px solid transparent",
+            color:tab===t.key?"#111827":"#9ca3af",
+            fontWeight:tab===t.key?700:500,fontSize:14,transition:"all 0.15s",
+          }}>{t.label}</button>
+        );})}
+      </div>
+    </div>
+  );
+}
+
+// ============ TYPE BADGE ============
+function TypeBadge(props){
+  var t=props.type;
+  return (
+    <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:3,
+      background:t==="drill"?"#f0fdf4":"#eef2ff",
+      color:t==="drill"?DRILL_COLOR:LASER_COLOR,
+    }}>{t==="drill"?"機鑽":"雷鑽"}</span>
+  );
+}
+
+// ============ TAB 1: OVERVIEW ============
+function OverviewTab(){
+  var groups=[
+    {label:"機鑽 Takeuchi",machines:DRILL_MACHINES,accent:DRILL_COLOR},
+    {label:"雷鑽 Kataoka",machines:LASER_MACHINES,accent:LASER_COLOR},
+  ];
+  var allRun=ALL_MACHINES.filter(function(m){return m.state==="RUN";}).length;
+  var allIdle=ALL_MACHINES.filter(function(m){return m.state==="IDLE";}).length;
+  var allStop=ALL_MACHINES.filter(function(m){return m.state==="STOP"||m.state==="MAINT";}).length;
+  return (
+    <div>
+      <div style={{display:"flex",gap:12,marginBottom:20}}>
+        {[
+          {label:"稼動中",val:allRun,unit:"/ "+ALL_MACHINES.length+" 台",color:"#059669"},
+          {label:"閒置",val:allIdle,unit:"台",color:"#d97706"},
+          {label:"停機 / 維護",val:allStop,unit:"台",color:"#dc2626"},
+        ].map(function(c,i){return (
+          <div key={i} style={{flex:1,background:"#fff",borderRadius:10,padding:"14px 18px",border:"1px solid #e5e7eb",borderLeft:"4px solid "+c.color}}>
+            <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>{c.label}</div>
+            <div style={{display:"flex",alignItems:"baseline",gap:4}}>
+              <span style={{fontSize:32,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</span>
+              <span style={{fontSize:13,color:"#9ca3af"}}>{c.unit}</span>
+            </div>
+          </div>
+        );})}
+      </div>
+      {groups.map(function(g){return (
+        <div key={g.label} style={{marginBottom:20}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+            <div style={{width:4,height:16,borderRadius:2,background:g.accent}}/>
+            <span style={{fontSize:14,fontWeight:700,color:"#111827"}}>{g.label}</span>
+            <span style={{fontSize:12,color:"#9ca3af"}}>({g.machines.length} 台)</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",gap:10}}>
+            {g.machines.map(function(m){
+              var s=SC[m.state];
+              return (
+                <div key={m.id} style={{background:"#fff",borderRadius:10,overflow:"hidden",border:"1px solid #e5e7eb"}}>
+                  <div style={{background:s.bg,color:"#fff",padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:15,fontWeight:800}}>{m.id}</span>
+                    <span style={{fontSize:12,fontWeight:600,background:"rgba(255,255,255,0.2)",padding:"2px 10px",borderRadius:20}}>{s.label}</span>
+                  </div>
+                  <div style={{padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:11,color:"#9ca3af"}}>持續時間</div>
+                      <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>{durStr(m.dur)}</div>
+                    </div>
+                    {m.state==="IDLE"&&m.dur>30&&(
+                      <div style={{fontSize:11,fontWeight:600,color:"#dc2626",background:"#fef2f2",padding:"3px 8px",borderRadius:4}}>⚠ 閒置過久</div>
+                    )}
+                    {m.state==="RUN"&&m.detail&&(
+                      <div style={{textAlign:"right"}}>
+                        <div style={{fontSize:10,color:"#9ca3af"}}>工號</div>
+                        <div style={{fontSize:12,fontWeight:600,color:"#374151"}}>{m.detail.wo}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );})}
+      <div style={{display:"flex",gap:16,fontSize:12,color:"#6b7280"}}>
+        {Object.entries(SC).map(function(arr){var k=arr[0],v=arr[1];return (
+          <div key={k} style={{display:"flex",alignItems:"center",gap:5}}>
+            <div style={{width:14,height:8,borderRadius:2,background:v.bg}}/><span>{v.label}</span>
+          </div>
+        );})}
+      </div>
+    </div>
+  );
+}
+
+// ============ TREND BAR CHART ============
+function TrendChart(props){
+  var data=props.data,onBarClick=props.onBarClick,activeIndex=props.activeIndex,accentColor=props.accentColor||"#059669",chartH=props.chartH||240;
+  var maxVal=100,barCount=data.length;
+  var barW=barCount>10?48:barCount>7?64:80;
+  var gap=barCount>10?6:10;
+  return (
+    <div style={{overflowX:"auto",padding:"8px 0"}}>
+      <div style={{position:"relative",paddingLeft:40,paddingBottom:44,height:chartH+44,minWidth:barCount*(barW+gap)+70}}>
+        {[0,25,50,75,100].map(function(v){
+          var y=chartH-(v/maxVal)*chartH;
+          var isTarget=v===TARGET;
+          return (
+            <div key={v} style={{position:"absolute",left:0,top:y,width:"100%",display:"flex",alignItems:"center"}}>
+              <span style={{fontSize:11,color:isTarget?"#3b82f6":"#9ca3af",width:32,textAlign:"right",marginRight:8,fontWeight:isTarget?700:400}}>{v}%</span>
+              <div style={{flex:1,height:isTarget?2:1,background:isTarget?"#3b82f6":"#e5e7eb",opacity:isTarget?0.4:0.6}}/>
+            </div>
+          );
+        })}
+        <div style={{position:"absolute",right:8,top:chartH-(TARGET/maxVal)*chartH-10,fontSize:10,color:"#3b82f6",fontWeight:700,background:"#eff6ff",padding:"2px 6px",borderRadius:3}}>
+          目標{TARGET}%
+        </div>
+        <div style={{position:"absolute",left:48,bottom:44,display:"flex",gap:gap,alignItems:"flex-end",height:chartH}}>
+          {data.map(function(d,i){
+            var val=d.util;
+            var hasData=val!==null&&val!==undefined;
+            var h=hasData?(val/maxVal)*chartH:0;
+            var c=!hasData?"#e5e7eb":val>=TARGET?"#059669":val>=50?"#d97706":"#dc2626";
+            var isActive=activeIndex===i;
+            var isClickable=hasData&&onBarClick;
+            return (
+              <div key={i} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3,cursor:isClickable?"pointer":"default"}}
+                onClick={function(){if(isClickable)onBarClick(i,d);}}>
+                {hasData&&(
+                  <span style={{fontSize:14,fontWeight:800,color:c,fontVariantNumeric:"tabular-nums"}}>{val}%</span>
+                )}
+                {!hasData&&(
+                  <span style={{fontSize:11,color:"#d1d5db"}}>—</span>
+                )}
+                <div style={{
+                  width:barW,height:hasData?Math.max(h,6):chartH*0.03,
+                  background:hasData?c:"#f3f4f6",
+                  borderRadius:"5px 5px 0 0",transition:"all 0.3s ease",
+                  opacity:hasData?(isActive?1:0.8):0.25,
+                  border:isActive?"3px solid #111827":"2px solid transparent",
+                  boxShadow:isActive?"0 -4px 12px rgba(0,0,0,0.12)":"none",
+                  position:"relative",
+                }}>
+                  {d.isCurrent&&hasData&&(
+                    <div style={{position:"absolute",top:-5,left:"50%",transform:"translateX(-50%)",width:8,height:8,borderRadius:4,background:"#3b82f6",border:"2px solid #fff"}}/>
+                  )}
+                </div>
+                <span style={{fontSize:12,fontWeight:isActive||d.isCurrent?800:500,color:isActive?"#111827":d.isCurrent?"#3b82f6":"#6b7280",marginTop:2}}>
+                  {d.label}
+                </span>
+                {hasData&&(
+                  <span style={{fontSize:9,color:"#9ca3af"}}>{fmt(d.holes)}孔</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============ TAB 2: RANKING ============
+function RankingTab(){
+  var _s1=useState("month"),drillLevel=_s1[0],setDrillLevel=_s1[1];
+  var _s2=useState(null),selectedMonth=_s2[0],setSelectedMonth=_s2[1];
+  var _s3=useState(null),selectedWeek=_s3[0],setSelectedWeek=_s3[1];
+  var _s4=useState(null),activeBarIdx=_s4[0],setActiveBarIdx=_s4[1];
+  var _s5=useState("all"),kpiFilter=_s5[0],setKpiFilter=_s5[1];
+
+  function getChartData(trend){
+    if(drillLevel==="month") return trend.months;
+    if(drillLevel==="week"&&selectedMonth) return trend.weeks[selectedMonth]||[];
+    if(drillLevel==="day"&&selectedMonth&&selectedWeek) return (trend.days[selectedMonth]||{})[selectedWeek]||[];
+    return [];
+  }
+  var drillData=getChartData(DRILL_TREND);
+  var laserData=getChartData(LASER_TREND);
+
+  var chartTitle="";
+  var breadcrumb=[];
+  if(drillLevel==="month"){
+    chartTitle="2026 年 — 各月平均稼動率";
+    breadcrumb=[{label:"年度總覽",active:true}];
+  } else if(drillLevel==="week"&&selectedMonth){
+    chartTitle="2026 年 "+selectedMonth+" 月 — 各週平均稼動率";
+    breadcrumb=[{label:"年度總覽",active:false,action:function(){setDrillLevel("month");setSelectedMonth(null);setSelectedWeek(null);setActiveBarIdx(null);}},{label:selectedMonth+"月",active:true}];
+  } else if(drillLevel==="day"&&selectedMonth&&selectedWeek){
+    chartTitle="2026 年 "+selectedMonth+" 月 第"+selectedWeek+"週 — 各日平均稼動率";
+    breadcrumb=[
+      {label:"年度總覽",active:false,action:function(){setDrillLevel("month");setSelectedMonth(null);setSelectedWeek(null);setActiveBarIdx(null);}},
+      {label:selectedMonth+"月",active:false,action:function(){setDrillLevel("week");setSelectedWeek(null);setActiveBarIdx(null);}},
+      {label:"第"+selectedWeek+"週",active:true},
+    ];
+  }
+
+  // Linked drill-down: clicking either chart drills both
+  var handleBarClick=function(idx,d){
+    setActiveBarIdx(idx);
+    if(drillLevel==="month"&&d.util!==null){setSelectedMonth(d.month);setDrillLevel("week");setActiveBarIdx(null);}
+    else if(drillLevel==="week"){setSelectedWeek(d.week);setDrillLevel("day");setActiveBarIdx(null);}
+  };
+
+  // KPI calculations
+  function calcAvg(machines){
+    return machines.length?Math.round(machines.reduce(function(s,m){return s+m.util.month;},0)/machines.length):0;
+  }
+  var kpiMachines=kpiFilter==="drill"?DRILL_MACHINES:kpiFilter==="laser"?LASER_MACHINES:ALL_MACHINES;
+  var avgUtil=calcAvg(kpiMachines);
+  var kpiLabel=kpiFilter==="drill"?"機鑽 13 台":kpiFilter==="laser"?"雷鑽 4 台":"全部 17 台";
+
+  // Period avg from chart data
+  function periodAvg(data){
+    var valid=data.filter(function(d){return d.util!==null;});
+    return valid.length?Math.round(valid.reduce(function(s,d){return s+d.util;},0)/valid.length):0;
+  }
+  var drillAvg=periodAvg(drillData);
+  var laserAvg=periodAvg(laserData);
+
+  return (
+    <div>
+      {/* KPI Row with filter */}
+      <div style={{display:"flex",gap:12,marginBottom:20,alignItems:"stretch"}}>
+        <div style={{flex:2,background:"#fff",borderRadius:12,padding:"18px 24px",border:"1px solid #e5e7eb"}}>
+          <div style={{display:"flex",gap:4,marginBottom:10}}>
+            {[{key:"all",label:"全部"},{key:"drill",label:"機鑽"},{key:"laser",label:"雷鑽"}].map(function(f){return (
+              <button key={f.key} onClick={function(){setKpiFilter(f.key);}} style={{
+                padding:"4px 14px",borderRadius:5,border:"1.5px solid",fontSize:12,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
+                background:kpiFilter===f.key?"#111827":"#fff",
+                color:kpiFilter===f.key?"#fff":"#6b7280",
+                borderColor:kpiFilter===f.key?"#111827":"#e5e7eb",
+              }}>{f.label}</button>
+            );})}
+          </div>
+          <div style={{fontSize:11,color:"#6b7280",marginBottom:4}}>平均稼動率（{kpiLabel}）</div>
+          <div style={{display:"flex",alignItems:"baseline",gap:6}}>
+            <span style={{fontSize:56,fontWeight:800,color:avgUtil>=TARGET?"#059669":"#d97706",lineHeight:1,fontVariantNumeric:"tabular-nums",letterSpacing:"-2px"}}>{avgUtil}</span>
+            <span style={{fontSize:24,fontWeight:700,color:avgUtil>=TARGET?"#059669":"#d97706"}}>%</span>
+          </div>
+          <div style={{fontSize:12,color:avgUtil>=TARGET?"#059669":"#d97706",marginTop:4,fontWeight:600}}>
+            {avgUtil>=TARGET?"✓ 達標":"✗ 未達標"}
+            <span style={{color:"#9ca3af",fontWeight:400,marginLeft:8}}>目標 {TARGET}%</span>
+          </div>
+        </div>
+        {/* Quick compare cards */}
+        <div style={{flex:1,background:"#f0fdf4",borderRadius:12,padding:"18px 20px",border:"1px solid #bbf7d0",display:"flex",flexDirection:"column",justifyContent:"center"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <div style={{width:10,height:10,borderRadius:2,background:DRILL_COLOR}}/>
+            <span style={{fontSize:12,color:"#6b7280"}}>機鑽平均</span>
+          </div>
+          <div style={{fontSize:36,fontWeight:800,color:DRILL_COLOR,lineHeight:1}}>{drillAvg}%</div>
+        </div>
+        <div style={{flex:1,background:"#eef2ff",borderRadius:12,padding:"18px 20px",border:"1px solid #c7d2fe",display:"flex",flexDirection:"column",justifyContent:"center"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <div style={{width:10,height:10,borderRadius:2,background:LASER_COLOR}}/>
+            <span style={{fontSize:12,color:"#6b7280"}}>雷鑽平均</span>
+          </div>
+          <div style={{fontSize:36,fontWeight:800,color:LASER_COLOR,lineHeight:1}}>{laserAvg}%</div>
+        </div>
+      </div>
+
+      {/* Shared Breadcrumb + Title */}
+      <div style={{background:"#fff",borderRadius:12,border:"1px solid #e5e7eb",padding:"20px 24px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4}}>
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+              {breadcrumb.map(function(b,i){return (
+                <div key={i} style={{display:"flex",alignItems:"center",gap:6}}>
+                  {i>0&&<span style={{color:"#d1d5db",fontSize:13}}>›</span>}
+                  {b.active?(
+                    <span style={{fontSize:13,fontWeight:700,color:"#111827",background:"#f3f4f6",padding:"3px 10px",borderRadius:4}}>{b.label}</span>
+                  ):(
+                    <button onClick={b.action} style={{fontSize:13,fontWeight:500,color:"#3b82f6",background:"#eff6ff",border:"none",cursor:"pointer",padding:"3px 10px",borderRadius:4}}>{b.label}</button>
+                  )}
+                </div>
+              );})}
+            </div>
+            <div style={{fontSize:16,fontWeight:700,color:"#111827"}}>{chartTitle}</div>
+          </div>
+          {drillLevel!=="day"&&(
+            <div style={{fontSize:11,color:"#6b7280",background:"#f3f4f6",padding:"5px 12px",borderRadius:5,fontWeight:500}}>
+              👆 點擊柱狀下鑽
+            </div>
+          )}
+        </div>
+
+        {/* Drill Chart */}
+        <div style={{marginTop:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+            <div style={{width:4,height:14,borderRadius:2,background:DRILL_COLOR}}/>
+            <span style={{fontSize:13,fontWeight:700,color:"#111827"}}>機鑽 Takeuchi</span>
+            <span style={{fontSize:12,color:"#9ca3af"}}>13 台 ｜ 平均 {drillAvg}%</span>
+          </div>
+          <TrendChart data={drillData} onBarClick={drillLevel!=="day"?handleBarClick:null} activeIndex={activeBarIdx} accentColor={DRILL_COLOR} chartH={200}/>
+        </div>
+
+        <div style={{height:1,background:"#e5e7eb",margin:"8px 0 16px"}}/>
+
+        {/* Laser Chart */}
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+            <div style={{width:4,height:14,borderRadius:2,background:LASER_COLOR}}/>
+            <span style={{fontSize:13,fontWeight:700,color:"#111827"}}>雷鑽 Kataoka</span>
+            <span style={{fontSize:12,color:"#9ca3af"}}>4 台 ｜ 平均 {laserAvg}%</span>
+          </div>
+          <TrendChart data={laserData} onBarClick={drillLevel!=="day"?handleBarClick:null} activeIndex={activeBarIdx} accentColor={LASER_COLOR} chartH={200}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============ TAB 3: ANALYSIS ============
+function AnalysisTab(){
+  var _s1=useState(null),hoveredCell=_s1[0],setHoveredCell=_s1[1];
+  var _s2=useState("all"),filter=_s2[0],setFilter=_s2[1];
+  var dayStart=8,dayEnd=20;
+  var filterOpts=[
+    {key:"all",label:"全部顯示",desc:"完整24小時稼動分布"},
+    {key:"low25",label:"< 25%",desc:"嚴重低稼動時段"},
+    {key:"low50",label:"< 50%",desc:"低於半數稼動時段"},
+    {key:"high75",label:"≥ 75%",desc:"達標時段"},
+  ];
+  var utilColor=function(v,f){
+    if(f==="low25") return v<25?"#dc2626":"#f9fafb";
+    if(f==="low50") return v<50?(v<25?"#dc2626":"#f59e0b"):"#f9fafb";
+    if(f==="high75") return v>=75?"#059669":"#f9fafb";
+    if(v===0) return "#f3f4f6";if(v<25) return "#fecaca";if(v<50) return "#fde68a";if(v<75) return "#bef264";return "#4ade80";
+  };
+  var textColor=function(v,f){
+    if(f==="low25") return v<25?"#fff":"#d1d5db";
+    if(f==="low50") return v<50?"#fff":"#d1d5db";
+    if(f==="high75") return v>=75?"#fff":"#d1d5db";
+    if(v>=75) return "#166534";if(v>=50) return "#713f12";if(v>=25) return "#991b1b";return "#9ca3af";
+  };
+  var shiftAvgs=ALL_MACHINES.map(function(m){
+    var day=m.timeline.filter(function(t){return t.hour>=dayStart&&t.hour<dayEnd;});
+    var night=m.timeline.filter(function(t){return t.hour<dayStart||t.hour>=dayEnd;});
+    return {day:day.length?Math.round(day.reduce(function(s,t){return s+t.util;},0)/day.length):0,night:night.length?Math.round(night.reduce(function(s,t){return s+t.util;},0)/night.length):0};
+  });
+  var oDay=Math.round(shiftAvgs.reduce(function(s,a){return s+a.day;},0)/shiftAvgs.length);
+  var oNight=Math.round(shiftAvgs.reduce(function(s,a){return s+a.night;},0)/shiftAvgs.length);
+  var countFiltered=function(){var c=0;ALL_MACHINES.forEach(function(m){m.timeline.forEach(function(t){if(filter==="low25"&&t.util<25)c++;if(filter==="low50"&&t.util<50)c++;if(filter==="high75"&&t.util>=75)c++;});});return c;};
+  var cellW=32,cellH=26,labelW=78,shiftW=52;
+
+  // Mixed ranking
+  var sorted=[].concat(ALL_MACHINES).sort(function(a,b){return b.util.month-a.util.month;});
+
+  return (
+    <div>
+      {/* Mixed Ranking */}
+      <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"18px 24px",marginBottom:20}}>
+        <div style={{fontSize:13,fontWeight:600,color:"#374151",marginBottom:12}}>各機台稼動率排行（本月）</div>
+        <div style={{display:"flex",flexDirection:"column",gap:5}}>
+          {sorted.map(function(m,i){
+            var v=m.util.month;
+            var c=v>=TARGET?"#059669":v>=50?"#d97706":"#dc2626";
+            var s=SC[m.state];
+            var typeColor=m.type==="drill"?DRILL_COLOR:LASER_COLOR;
+            return (
+              <div key={m.id} style={{display:"flex",alignItems:"center",gap:8,height:26}}>
+                <span style={{width:20,height:20,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,flexShrink:0,background:i<3?"#f0fdf4":i>=14?"#fef2f2":"#f9fafb",color:i<3?"#059669":i>=14?"#dc2626":"#9ca3af"}}>{i+1}</span>
+                <div style={{width:4,height:14,borderRadius:2,background:typeColor,flexShrink:0}}/>
+                <div style={{width:74,display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+                  <div style={{width:6,height:6,borderRadius:2,background:s.bg}}/>
+                  <span style={{fontSize:11,fontWeight:600,color:"#374151"}}>{m.id.replace("DRILL-","機").replace("LASER-","雷")}</span>
+                </div>
+                <div style={{flex:1,height:14,background:"#f3f4f6",borderRadius:3,overflow:"hidden",position:"relative"}}>
+                  <div style={{width:v+"%",height:"100%",background:c,borderRadius:3,transition:"width 0.5s",display:"flex",alignItems:"center",justifyContent:"flex-end",paddingRight:5}}>
+                    {v>18&&<span style={{fontSize:9,fontWeight:700,color:"#fff"}}>{v}%</span>}
+                  </div>
+                  <div style={{position:"absolute",left:TARGET+"%",top:0,bottom:0,width:1.5,background:"#3b82f6",opacity:0.5}}/>
+                </div>
+                {v<=18&&<span style={{fontSize:10,fontWeight:700,color:c,width:28}}>{v}%</span>}
+                <span style={{fontSize:10,color:"#6b7280",width:64,textAlign:"right",flexShrink:0}}>{fmt(m.holes.month)}孔</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginTop:10,fontSize:11,color:"#9ca3af"}}>
+          <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:4,height:10,borderRadius:1,background:DRILL_COLOR}}/><span>機鑽</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:4,height:10,borderRadius:1,background:LASER_COLOR}}/><span>雷鑽</span></div>
+          <span>｜</span>
+          <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:12,height:2,background:"#3b82f6",borderRadius:1}}/><span>目標 {TARGET}%</span></div>
+        </div>
+      </div>
+
+      {/* Shift Summary */}
+      <div style={{display:"flex",gap:12,marginBottom:16}}>
+        {[
+          {label:"日班平均（08–20）",val:oDay+"%",color:oDay>=TARGET?"#059669":"#d97706",bg:"#f0fdf4",border:"#bbf7d0"},
+          {label:"夜班平均（20–08）",val:oNight+"%",color:oNight>=TARGET?"#059669":"#dc2626",bg:oNight>=TARGET?"#f0fdf4":"#fef2f2",border:oNight>=TARGET?"#bbf7d0":"#fecaca"},
+          {label:"日夜落差",val:(oDay-oNight)+"%",color:"#dc2626",bg:"#fef2f2",border:"#fecaca"},
+        ].map(function(c,i){return (
+          <div key={i} style={{flex:1,background:c.bg,borderRadius:10,padding:"12px 18px",border:"1px solid "+c.border}}>
+            <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>{c.label}</div>
+            <div style={{fontSize:28,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</div>
+          </div>
+        );})}
+      </div>
+
+      {/* Heatmap */}
+      <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"16px 20px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>24 小時稼動熱力圖</div>
+          <div style={{display:"flex",gap:4}}>
+            {filterOpts.map(function(f){return (
+              <button key={f.key} onClick={function(){setFilter(f.key);}} style={{
+                padding:"5px 12px",borderRadius:6,border:"1.5px solid",fontSize:11,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
+                background:filter===f.key?(f.key==="low25"?"#dc2626":f.key==="low50"?"#d97706":f.key==="high75"?"#059669":"#111827"):"#fff",
+                color:filter===f.key?"#fff":"#6b7280",borderColor:filter===f.key?"transparent":"#e5e7eb",
+              }}>{f.label}</button>
+            );})}
+          </div>
+        </div>
+        {filter!=="all"&&(
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 14px",borderRadius:6,marginBottom:12,fontSize:12,
+            background:filter==="low25"?"#fef2f2":filter==="low50"?"#fffbeb":"#f0fdf4",
+            border:"1px solid "+(filter==="low25"?"#fecaca":filter==="low50"?"#fde68a":"#bbf7d0"),
+            color:filter==="low25"?"#dc2626":filter==="low50"?"#d97706":"#059669",
+          }}>
+            <span style={{fontWeight:500}}>{(filterOpts.find(function(f){return f.key===filter;})||{}).desc} — 其餘時段淡化處理</span>
+            <span style={{fontWeight:700}}>共 {countFiltered()} 個時段</span>
+          </div>
+        )}
+        <div style={{overflowX:"auto"}}>
+          <div style={{minWidth:labelW+cellW*24+shiftW*2+16}}>
+            {/* Hour labels */}
+            <div style={{display:"flex",alignItems:"flex-end",marginBottom:2,paddingLeft:labelW}}>
+              {Array.from({length:24},function(_,h){return (
+                <div key={h} style={{width:cellW,textAlign:"center",fontSize:10,fontWeight:h===dayStart||h===dayEnd?700:400,color:h===dayStart||h===dayEnd?"#3b82f6":"#9ca3af"}}>
+                  {h.toString().padStart(2,"0")}
+                </div>
+              );})}
+              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:"#059669",marginLeft:8}}>日班</div>
+              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:"#6366f1"}}>夜班</div>
+            </div>
+            <div style={{display:"flex",marginBottom:4,paddingLeft:labelW}}>
+              {Array.from({length:24},function(_,h){return (
+                <div key={h} style={{width:cellW,height:3,background:(h>=dayStart&&h<dayEnd)?"#d1fae5":"#e0e7ff"}}/>
+              );})}
+            </div>
+
+            {/* Drill machines */}
+            {DRILL_MACHINES.map(function(m,mi){
+              var s=SC[m.state];var sa=shiftAvgs[mi];
+              return renderHeatRow(m,mi,s,sa,hoveredCell,setHoveredCell,filter,utilColor,textColor,cellW,cellH,labelW,shiftW,dayStart,dayEnd);
+            })}
+
+            {/* Separator */}
+            <div style={{display:"flex",alignItems:"center",margin:"6px 0",paddingLeft:labelW}}>
+              <div style={{flex:1,height:2,background:"#e5e7eb",borderRadius:1}}/>
+              <span style={{fontSize:10,color:"#9ca3af",padding:"0 10px",fontWeight:600}}>雷鑽 Kataoka</span>
+              <div style={{flex:1,height:2,background:"#e5e7eb",borderRadius:1}}/>
+            </div>
+
+            {/* Laser machines */}
+            {LASER_MACHINES.map(function(m,li){
+              var mi=DRILL_MACHINES.length+li;
+              var s=SC[m.state];var sa=shiftAvgs[mi];
+              return renderHeatRow(m,mi,s,sa,hoveredCell,setHoveredCell,filter,utilColor,textColor,cellW,cellH,labelW,shiftW,dayStart,dayEnd);
+            })}
+
+            {/* Tooltip */}
+            {hoveredCell&&(
+              <div style={{position:"fixed",top:8,right:28,zIndex:100,background:"#111827",color:"#fff",padding:"8px 14px",borderRadius:8,fontSize:12,fontWeight:500,boxShadow:"0 4px 12px rgba(0,0,0,0.15)",display:"flex",gap:12}}>
+                <span style={{fontWeight:700}}>{hoveredCell.id}</span>
+                <span>{String(hoveredCell.hour).padStart(2,"0")}:00</span>
+                <span style={{fontWeight:700,color:hoveredCell.util>=TARGET?"#4ade80":hoveredCell.util>=50?"#fbbf24":"#f87171"}}>{hoveredCell.util}%</span>
+                <span style={{color:"#9ca3af"}}>{hoveredCell.hour>=8&&hoveredCell.hour<20?"日班":"夜班"}</span>
+              </div>
+            )}
+          </div>
+        </div>
+        {/* Legend */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginTop:14,fontSize:11,color:"#6b7280",flexWrap:"wrap"}}>
+          {filter==="all"?(
+            <React.Fragment>
+              <span>稼動率：</span>
+              {[{label:"0%",color:"#f3f4f6"},{label:"<25%",color:"#fecaca"},{label:"25-49%",color:"#fde68a"},{label:"50-74%",color:"#bef264"},{label:"≥75%",color:"#4ade80"}].map(function(c,i){return (
+                <div key={i} style={{display:"flex",alignItems:"center",gap:3}}>
+                  <div style={{width:12,height:8,borderRadius:2,background:c.color,border:"1px solid #e5e7eb"}}/><span>{c.label}</span>
+                </div>
+              );})}
+            </React.Fragment>
+          ):(
+            <React.Fragment>
+              <span>篩選：</span>
+              <div style={{display:"flex",alignItems:"center",gap:3}}>
+                <div style={{width:12,height:8,borderRadius:2,background:filter==="low25"?"#dc2626":filter==="low50"?"#f59e0b":"#059669"}}/><span>符合</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:3}}>
+                <div style={{width:12,height:8,borderRadius:2,background:"#f9fafb",border:"1px solid #e5e7eb"}}/><span>淡化</span>
+              </div>
+            </React.Fragment>
+          )}
+          <span>｜</span>
+          <div style={{display:"flex",alignItems:"center",gap:3}}>
+            <div style={{width:2,height:8,background:"#3b82f6"}}/><span>班次分界</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function renderHeatRow(m,mi,s,sa,hoveredCell,setHoveredCell,filter,utilColor,textColor,cellW,cellH,labelW,shiftW,dayStart,dayEnd){
+  var typeColor=m.type==="drill"?DRILL_COLOR:LASER_COLOR;
+  return (
+    <div key={m.id} style={{display:"flex",alignItems:"center",marginBottom:2}}>
+      <div style={{width:labelW,display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+        <div style={{width:3,height:12,borderRadius:1,background:typeColor,flexShrink:0}}/>
+        <div style={{width:7,height:7,borderRadius:2,background:s.bg,flexShrink:0}}/>
+        <span style={{fontSize:10,fontWeight:600,color:"#374151"}}>{m.id.replace("DRILL-","機").replace("LASER-","雷")}</span>
+      </div>
+      {m.timeline.map(function(t,hi){
+        var isH=hoveredCell&&hoveredCell.mi===mi&&hoveredCell.hi===hi;
+        var bg=utilColor(t.util,filter);var tc=textColor(t.util,filter);
+        var isShiftB=t.hour===dayStart||t.hour===dayEnd;
+        var isActive=filter==="all"||(filter==="low25"&&t.util<25)||(filter==="low50"&&t.util<50)||(filter==="high75"&&t.util>=75);
+        return (
+          <div key={hi}
+            onMouseEnter={function(){setHoveredCell({mi:mi,hi:hi,id:m.id,hour:t.hour,util:t.util});}}
+            onMouseLeave={function(){setHoveredCell(null);}}
+            style={{width:cellW,height:cellH,background:bg,borderLeft:isShiftB?"2px solid #3b82f6":"1px solid rgba(255,255,255,0.8)",borderTop:"1px solid rgba(255,255,255,0.8)",
+              display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:isActive?700:400,color:tc,cursor:"default",
+              transform:isH?"scale(1.15)":"scale(1)",transition:"all 0.1s",zIndex:isH?5:1,position:"relative",borderRadius:isH?3:0,
+              boxShadow:isH?"0 2px 8px rgba(0,0,0,0.2)":"none",
+            }}>
+            {(isActive&&t.util>0)||isH?t.util:""}
+          </div>
+        );
+      })}
+      <div style={{width:shiftW,marginLeft:8,textAlign:"center",fontSize:10,fontWeight:700,color:sa.day>=TARGET?"#059669":"#d97706",background:sa.day>=TARGET?"#f0fdf4":"#fffbeb",borderRadius:3,padding:"3px 0"}}>{sa.day}%</div>
+      <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:700,color:sa.night>=TARGET?"#059669":sa.night>=40?"#d97706":"#dc2626",background:sa.night>=TARGET?"#f0fdf4":sa.night>=40?"#fffbeb":"#fef2f2",borderRadius:3,padding:"3px 0"}}>{sa.night}%</div>
+    </div>
+  );
+}
+
+// ============ TAB 4: DETAIL ============
+function DetailTab(){
+  var running=ALL_MACHINES.filter(function(m){return m.state==="RUN"&&m.detail;});
+  var notRunning=ALL_MACHINES.filter(function(m){return m.state!=="RUN";});
+  return (
+    <div>
+      <div style={{fontSize:13,fontWeight:600,color:"#374151",marginBottom:10}}>稼動中（{running.length} 台）</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(340px, 1fr))",gap:12,marginBottom:24}}>
+        {running.map(function(m){
+          var d=m.detail;var pct=Math.round(d.doneH/d.totalH*100);
+          var typeColor=m.type==="drill"?DRILL_COLOR:LASER_COLOR;
+          var typeLabel=m.type==="drill"?"機鑽":"雷鑽";
+          return (
+            <div key={m.id} style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",overflow:"hidden"}}>
+              <div style={{background:typeColor,color:"#fff",padding:"8px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontSize:15,fontWeight:800}}>{m.id}</span>
+                  <span style={{fontSize:10,fontWeight:600,background:"rgba(255,255,255,0.2)",padding:"1px 8px",borderRadius:10}}>{typeLabel}</span>
+                </div>
+                <span style={{fontSize:12,fontWeight:600}}>{durStr(m.dur)}</span>
+              </div>
+              <div style={{padding:"12px 14px"}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 20px",fontSize:13,marginBottom:12}}>
+                  {[["工號",d.wo,"#111827"],["板號",d.board,"#111827"],["針型",d.drill+" 針",typeColor],["進度","第 "+d.panel+" 片","#111827"]].map(function(arr){return (
+                    <div key={arr[0]}>
+                      <div style={{fontSize:10,color:"#9ca3af",marginBottom:1}}>{arr[0]}</div>
+                      <div style={{fontWeight:700,color:arr[2]}}>{arr[1]}</div>
+                    </div>
+                  );})}
+                </div>
+                <div style={{marginBottom:10}}>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:4}}>
+                    <span style={{color:"#6b7280"}}>孔數進度</span>
+                    <span style={{fontWeight:700,color:"#374151"}}>{fmt(d.doneH)} / {fmt(d.totalH)}</span>
+                  </div>
+                  <div style={{height:10,background:"#f3f4f6",borderRadius:5,overflow:"hidden"}}>
+                    <div style={{width:pct+"%",height:"100%",borderRadius:5,background:"linear-gradient(90deg,"+typeColor+","+typeColor+"aa)",transition:"width 0.5s"}}/>
+                  </div>
+                  <div style={{textAlign:"right",fontSize:11,fontWeight:600,color:typeColor,marginTop:2}}>{pct}%</div>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,background:"#eff6ff",border:"1px solid #bfdbfe"}}>
+                  <span style={{fontSize:12,color:"#3b82f6",fontWeight:500}}>⏱ 預計剩餘</span>
+                  <span style={{fontSize:18,fontWeight:800,color:"#1d4ed8",fontVariantNumeric:"tabular-nums"}}>{d.eta} 分鐘</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{fontSize:13,fontWeight:600,color:"#9ca3af",marginBottom:8}}>未稼動（{notRunning.length} 台）</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+        {notRunning.map(function(m){
+          var s=SC[m.state];
+          var typeColor=m.type==="drill"?DRILL_COLOR:LASER_COLOR;
+          return (
+            <div key={m.id} style={{display:"flex",alignItems:"center",gap:6,background:"#fff",borderRadius:8,padding:"8px 12px",border:"1px solid #e5e7eb"}}>
+              <div style={{width:3,height:14,borderRadius:1,background:typeColor}}/>
+              <div style={{width:8,height:8,borderRadius:2,background:s.bg}}/>
+              <span style={{fontSize:12,fontWeight:700,color:"#374151"}}>{m.id}</span>
+              <span style={{fontSize:11,color:s.bg,fontWeight:600}}>{s.label}</span>
+              <span style={{fontSize:10,color:"#9ca3af"}}>{durStr(m.dur)}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============ MAIN ============
+function Dashboard(){
+  var _s1=useState("overview"),tab=_s1[0],setTab=_s1[1];
+  var _s2=useState(600),cd=_s2[0],setCd=_s2[1];
+  useEffect(function(){var t=setInterval(function(){setCd(function(p){return p<=0?600:p-1;});},1000);return function(){clearInterval(t);};});
+  return (
+    <div style={{fontFamily:"'Noto Sans TC','Helvetica Neue','Microsoft JhengHei',sans-serif",background:"#f6f7f9",minHeight:"100vh",color:"#1a1a2e"}}>
+      <Header tab={tab} setTab={setTab} countdown={cd}/>
+      <div style={{padding:"20px 28px",maxWidth:1360,margin:"0 auto"}}>
+        {tab==="overview"&&<OverviewTab/>}
+        {tab==="ranking"&&<RankingTab/>}
+        {tab==="analysis"&&<AnalysisTab/>}
+        {tab==="detail"&&<DetailTab/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<Dashboard/>,document.getElementById("root"));
+</script>
+</body>
+</html>

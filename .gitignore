@@ -13,3 +13,22 @@ db/*.db
 logs/DRILL-01/
 logs/test_log.txt
 logs/test_log.txt.robocopy
+
+# Dev environment artifacts
+dev_logs/
+drill_monitor_dev.db
+drill_monitor_dev.db-shm
+drill_monitor_dev.db-wal
+drill_monitor_dev.log
+
+# Production DB in project root
+drill_monitor.db
+
+# Raw machine logs (large, not version controlled)
+original_logs/
+
+# Node / Playwright
+node_modules/
+screenshot/
+test-results/
+playwright-report/

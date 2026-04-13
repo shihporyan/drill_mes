@@ -1,0 +1,11 @@
+{
+  "poll_interval_seconds": 30,
+  "backup_root": "dev_logs",
+  "db_path": "drill_monitor_dev.db",
+  "db_archive_threshold_mb": 500,
+  "backup_retention_days": 90,
+  "http_host": "127.0.0.1",
+  "http_port": 8080,
+  "utilization_target": 75,
+  "log_file": "drill_monitor_dev.log"
+}
