@@ -17,6 +17,11 @@ test.describe('API Contract', () => {
     expect(data.summary).toHaveProperty('stopped');
     expect(data.summary).toHaveProperty('offline');
     expect(data.summary).toHaveProperty('total');
+
+    for (const machine of data.machines) {
+      expect(typeof machine.duration_minutes).toBe('number');
+      expect(machine.duration_minutes).toBeGreaterThanOrEqual(0);
+    }
   });
 
   test('GET /api/drilling/utilization returns valid structure', async ({ request }) => {

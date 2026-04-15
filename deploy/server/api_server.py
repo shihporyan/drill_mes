@@ -217,7 +217,10 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                 if since:
                     try:
                         since_dt = datetime.datetime.fromisoformat(since)
-                        duration_minutes = int((now - since_dt).total_seconds() / 60)
+                        # clamp: machine control PCs are offline (no NTP),
+                        # their clocks drift vs server — `since` may briefly
+                        # land in the server's future after a state transition
+                        duration_minutes = max(0, int((now - since_dt).total_seconds() / 60))
                     except (ValueError, TypeError):
                         pass
 
