@@ -59,3 +59,5 @@ npm run test:e2e:ui
 
 目前筆記：
 - [notes/laser_board_identification.md](notes/laser_board_identification.md) — 雷鑽 `.lsr` 宣告夾帶板名的可行性
+- [notes/work_detail_fields_investigation.md](notes/work_detail_fields_investigation.md) — 作業細節欄位調查（已完成）
+- [notes/work_detail_fields_plan.md](notes/work_detail_fields_plan.md) — 作業細節欄位規劃（機械鑽孔，討論中）

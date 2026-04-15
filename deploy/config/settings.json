@@ -3,7 +3,7 @@
   "backup_root": "C:\\DrillLogs",
   "db_path": "drill_monitor.db",
   "db_archive_threshold_mb": 500,
-  "backup_retention_days": 90,
+  "backup_retention_days": 7,
   "http_host": "127.0.0.1",
   "http_port": 8080,
   "utilization_target": 75,

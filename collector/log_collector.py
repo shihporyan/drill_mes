@@ -107,9 +107,17 @@ def collect_logs_for_machine(machine, settings):
     # Ensure destination directory exists
     os.makedirs(dest, exist_ok=True)
 
-    # robocopy with retry=1, wait=1sec, copy Drive.Log and TX1.Log
+    # Only copy today's + yesterday's files (2 pairs out of 31)
+    # Parser only needs these two days; copying all 31 wastes ~93% of disk and SMB I/O
+    yesterday = today - datetime.timedelta(days=1)
+    day_prefix = today.strftime("%d")
+    yesterday_prefix = yesterday.strftime("%d")
     cmd = [
-        "robocopy", source, dest, "*Drive.Log", "*TX1.Log",
+        "robocopy", source, dest,
+        "{}Drive.Log".format(day_prefix),
+        "{}TX1.Log".format(day_prefix),
+        "{}Drive.Log".format(yesterday_prefix),
+        "{}TX1.Log".format(yesterday_prefix),
         "/R:1", "/W:1",
     ]
 

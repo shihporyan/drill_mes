@@ -174,6 +174,7 @@ deploy/
 ├── parsers/
 │   ├── base_parser.py      # 共用工具（設定載入、DB 連線、增量追蹤）
 │   ├── drive_log_parser.py # Takeuchi 機鑽 Drive.Log 解析
+│   ├── tx1_log_parser.py   # Takeuchi TX1.Log 工單追蹤
 │   └── laser_log_parser.py # Kataoka 雷鑽 LOG 解析
 ├── collector/
 │   ├── log_collector.py    # Takeuchi 機台 LOG 收集（robocopy）

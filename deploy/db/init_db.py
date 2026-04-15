@@ -15,10 +15,6 @@ import sqlite3
 import sys
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 # Resolve project root (parent of db/)
@@ -160,6 +156,10 @@ def _run_migrations(db_path):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     custom_path = None
     if len(sys.argv) > 1 and sys.argv[1] == "--db-path" and len(sys.argv) > 2:
         custom_path = sys.argv[2]

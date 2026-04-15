@@ -18,6 +18,7 @@ Usage:
 
 import datetime
 import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -30,6 +31,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from db.init_db import init_database
 from parsers.base_parser import load_settings, load_machines_config, get_db_path
 from parsers.drive_log_parser import run_parser_cycle, run_parser_loop
+from parsers.tx1_log_parser import run_parser_cycle as run_tx1_parser_cycle
 from parsers.laser_log_parser import run_parser_cycle as run_laser_parser_cycle
 from collector.log_collector import run_collection_cycle, run_collection_loop
 from collector.laser_log_collector import run_collection_cycle as run_laser_collection_cycle
@@ -40,14 +42,24 @@ logger = logging.getLogger("drill_monitor")
 
 
 def setup_logging(settings):
-    """Configure logging to console and file.
+    """Configure logging to console and rotating file.
 
     Args:
         settings: Settings dict with optional log_file path.
     """
     log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    handlers = [logging.StreamHandler(sys.stdout)]
+    formatter = logging.Formatter(log_format)
 
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    # Rotating file handler (10 MB per file, keep 5 backups)
     log_file = settings.get("log_file")
     if log_file:
         if not os.path.isabs(log_file):
@@ -55,13 +67,11 @@ def setup_logging(settings):
         log_dir = os.path.dirname(log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
-        handlers=handlers,
-    )
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
 
 def run_collect_and_parse_loop(settings, machines_config, db_path):
@@ -98,6 +108,13 @@ def run_collect_and_parse_loop(settings, machines_config, db_path):
             run_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
         except Exception as e:
             logger.error("Parser failed: %s", e, exc_info=True)
+
+        try:
+            # Step 2a: Parse TX1.Log for work order tracking
+            logger.info("--- TX1 parser cycle ---")
+            run_tx1_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
+        except Exception as e:
+            logger.error("TX1 parser failed: %s", e, exc_info=True)
 
         try:
             # Step 2b: Parse collected logs (laser)
@@ -146,8 +163,9 @@ def run_once():
     run_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
     run_laser_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
 
-    # Parse (mechanical + laser)
+    # Parse (mechanical + TX1 work order + laser)
     run_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
+    run_tx1_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
     run_laser_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
 
     # Cleanup
