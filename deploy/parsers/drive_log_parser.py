@@ -43,7 +43,7 @@ from parsers.base_parser import (
 logger = logging.getLogger(__name__)
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
-WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)$", re.IGNORECASE)
+WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)\d*$", re.IGNORECASE)
 
 # Max seconds to attribute from a single gap between consecutive rows.
 # Gaps within this limit are assumed to be the same state (firmware skip).

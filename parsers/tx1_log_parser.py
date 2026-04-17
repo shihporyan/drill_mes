@@ -162,10 +162,14 @@ def backfill_work_order(db_path, machine_id, backup_root, max_days_back=7):
     the normal today + yesterday parse path).
 
     Scans today's backup folder for older day_prefix files. Because
-    robocopy copies the entire LOG directory each cycle, today's
-    folder contains the freshest copy of every {DD}TX1.Log file.
-    Iterates day_prefix from today backward through max_days_back
+    robocopy copies the entire `\LOG\` directory each cycle, today's
+    folder contains the freshest copy of every `{DD}TX1.Log` file
+    (including older days that were closed out at their month-end).
+    Iterates day_prefix from today backward through `max_days_back`
     days; stops at the first file that has a production LOAD event.
+
+    All I/O is against local backup files; this function never touches
+    the machine control computer's SMB share.
 
     Args:
         db_path: Path to SQLite database.
@@ -190,6 +194,8 @@ def backfill_work_order(db_path, machine_id, backup_root, max_days_back=7):
         for days_back in range(max_days_back + 1):
             target_date = today - datetime.timedelta(days=days_back)
             day_prefix = target_date.strftime("%d")
+            # Always read from today's backup folder — robocopy keeps the
+            # freshest copy of every older day's log there.
             log_path = os.path.join(
                 backup_root, machine_id, today_dir,
                 "{}TX1.Log".format(day_prefix),
@@ -288,17 +294,37 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
 
     today = datetime.date.today()
     day_prefix = today.strftime("%d")
+    date_dir = today.strftime("%Y%m%d")
     backup_root = get_backup_root(settings)
+
+    # Yesterday's day_prefix — today's backup folder has a fresher copy of
+    # yesterday's TX1.Log (robocopy copies today's + yesterday's files each cycle).
+    yesterday = today - datetime.timedelta(days=1)
+    yesterday_prefix = yesterday.strftime("%d")
 
     logger.info("TX1 parser cycle start: %d Takeuchi machines, day_prefix=%s",
                 len(takeuchi_machines), day_prefix)
 
     for machine in takeuchi_machines:
         machine_id = machine["id"]
-        log_path = get_tx1_log_path(settings, machine_id, day_prefix)
 
+        # Parse yesterday's TX1.Log from today's backup (catches late-night events)
+        yesterday_path = os.path.join(
+            backup_root, machine_id, date_dir,
+            "{}TX1.Log".format(yesterday_prefix),
+        )
+        yesterday_progress_key = "tx1_{}".format(yesterday_prefix)
         try:
-            parse_tx1_file(db_path, machine_id, log_path, day_prefix)
+            parse_tx1_file(db_path, machine_id, yesterday_path, yesterday_prefix,
+                           reference_date=yesterday)
+        except Exception as e:
+            logger.error("[%s] TX1 parser error (prev-day): %s", machine_id, e, exc_info=True)
+
+        # Parse today's TX1.Log
+        log_path = get_tx1_log_path(settings, machine_id, day_prefix)
+        try:
+            parse_tx1_file(db_path, machine_id, log_path, day_prefix,
+                           reference_date=today)
         except Exception as e:
             logger.error("[%s] TX1 parser error: %s", machine_id, e, exc_info=True)
 

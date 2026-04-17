@@ -43,7 +43,7 @@ from parsers.base_parser import (
 logger = logging.getLogger(__name__)
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
-WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)$", re.IGNORECASE)
+WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)\d*$", re.IGNORECASE)
 
 # Max seconds to attribute from a single gap between consecutive rows.
 # Gaps within this limit are assumed to be the same state (firmware skip).
@@ -289,10 +289,13 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
             if progress and progress[0] and prev_state:
                 try:
                     prev_dt = datetime.datetime.fromisoformat(progress[0])
-                    bridge_delta = (parsed_rows[0]["datetime"] - prev_dt).total_seconds()
+                    # Start 1 second after prev_dt because the previous batch
+                    # already attributed 1 second to its last row.
+                    bridge_start = prev_dt + datetime.timedelta(seconds=1)
+                    bridge_delta = (parsed_rows[0]["datetime"] - bridge_start).total_seconds()
                     if 0 < bridge_delta <= GAP_CAP_SECONDS:
                         _distribute_seconds(
-                            prev_dt, bridge_delta, prev_state.lower(), hourly)
+                            bridge_start, bridge_delta, prev_state.lower(), hourly)
                 except (ValueError, TypeError):
                     pass
 
@@ -379,12 +382,16 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                 "total_seconds, utilization, hole_count) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(machine_id, date, hour) DO UPDATE SET "
-                "run_seconds=excluded.run_seconds, "
-                "reset_seconds=excluded.reset_seconds, "
-                "stop_seconds=excluded.stop_seconds, "
-                "total_seconds=excluded.total_seconds, "
-                "utilization=excluded.utilization, "
-                "hole_count=excluded.hole_count",
+                "run_seconds = hourly_utilization.run_seconds + excluded.run_seconds, "
+                "reset_seconds = hourly_utilization.reset_seconds + excluded.reset_seconds, "
+                "stop_seconds = hourly_utilization.stop_seconds + excluded.stop_seconds, "
+                "total_seconds = hourly_utilization.total_seconds + excluded.total_seconds, "
+                "utilization = CASE "
+                "  WHEN (hourly_utilization.total_seconds + excluded.total_seconds) > 0 "
+                "  THEN ROUND(CAST(hourly_utilization.run_seconds + excluded.run_seconds AS REAL) "
+                "       / (hourly_utilization.total_seconds + excluded.total_seconds) * 100.0, 1) "
+                "  ELSE 0.0 END, "
+                "hole_count = hourly_utilization.hole_count + excluded.hole_count",
                 (machine_id, date_str, hour,
                  bucket["run"], bucket["reset"], bucket["stop"],
                  total, util, bucket["hole_count"]),
@@ -492,13 +499,31 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
 
     today = datetime.date.today()
     day_prefix = today.strftime("%d")
+    date_dir = today.strftime("%Y%m%d")
+    backup_root = get_backup_root(settings)
+
+    # Yesterday's day_prefix — today's backup folder has a fresher copy of
+    # yesterday's LOG (robocopy copies today's + yesterday's files each cycle).
+    yesterday = today - datetime.timedelta(days=1)
+    yesterday_prefix = yesterday.strftime("%d")
 
     logger.info("Parser cycle start: %d enabled machines, day_prefix=%s", len(enabled), day_prefix)
 
     for machine in enabled:
         machine_id = machine["id"]
-        log_path = get_log_path(settings, machine_id, day_prefix)
 
+        # Parse yesterday's Drive.Log from today's backup (catches late-night data)
+        yesterday_path = os.path.join(
+            backup_root, machine_id, date_dir,
+            "{}Drive.Log".format(yesterday_prefix),
+        )
+        try:
+            parse_log_file(db_path, machine_id, yesterday_path, yesterday_prefix)
+        except Exception as e:
+            logger.error("[%s] Parser error (prev-day): %s", machine_id, e, exc_info=True)
+
+        # Parse today's Drive.Log
+        log_path = get_log_path(settings, machine_id, day_prefix)
         try:
             parse_log_file(db_path, machine_id, log_path, day_prefix)
         except Exception as e:
