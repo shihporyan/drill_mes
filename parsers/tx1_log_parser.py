@@ -62,7 +62,7 @@ def parse_fileoperation_line(line):
     return {"timestamp": iso_ts, "program_name": program_name}
 
 
-def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
+def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=None):
     """Parse TX1.Log incrementally and update work order in machine_current_state.
 
     Args:
@@ -70,6 +70,9 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
         machine_id: Machine identifier (e.g. 'M13').
         log_path: Full path to the TX1.Log file.
         day_prefix: Two-digit day string (e.g. '10').
+        reference_date: Expected date for this file's events. Events more than
+            2 days before this date are skipped (stale previous-month data).
+            Defaults to today.
     """
     if not os.path.exists(log_path):
         return
@@ -105,11 +108,24 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
             if event:
                 events.append(event)
 
-        # Find last production program in new events
+        # Find last production program in new events.
+        # Filter out events from previous months — TX1.Log files are
+        # monthly-rotating ({DD}TX1.Log), so at midnight the file for
+        # today's day_prefix may still contain last month's data until
+        # the machine overwrites it.
+        ref_date = reference_date or datetime.date.today()
         last_wo = None
         last_side = None
         last_ts = None
         for event in events:
+            try:
+                event_date = datetime.datetime.fromisoformat(
+                    event["timestamp"].split(".")[0]
+                ).date()
+                if (ref_date - event_date).days > 2:
+                    continue  # Skip stale previous-month data
+            except (ValueError, TypeError):
+                continue
             wo, side = extract_work_order(event["program_name"])
             if wo:
                 last_wo = wo
@@ -132,6 +148,102 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
             last_event_ts = events[-1]["timestamp"]
         update_parse_progress(conn, machine_id, progress_key, total_lines, last_event_ts, file_size)
 
+    finally:
+        conn.close()
+
+
+def backfill_work_order(db_path, machine_id, backup_root, max_days_back=7):
+    """Recover a missing work_order by scanning recent backup TX1.Log files.
+
+    Only acts when the machine's work_order is currently NULL in
+    machine_current_state.  This handles the case where the DB was
+    recreated or the system started fresh while the last production
+    program LOAD event is more than one day old (beyond the reach of
+    the normal today + yesterday parse path).
+
+    Scans today's backup folder for older day_prefix files. Because
+    robocopy copies the entire LOG directory each cycle, today's
+    folder contains the freshest copy of every {DD}TX1.Log file.
+    Iterates day_prefix from today backward through max_days_back
+    days; stops at the first file that has a production LOAD event.
+
+    Args:
+        db_path: Path to SQLite database.
+        machine_id: Machine identifier (e.g. 'M13').
+        backup_root: Absolute path to the backup root directory.
+        max_days_back: How many days to scan backward (default 7).
+    """
+    conn = get_db_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT work_order FROM machine_current_state WHERE machine_id=?",
+            (machine_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return  # No current_state row yet (Drive.Log parser hasn't run)
+        if row[0]:
+            return  # Already have a work_order — nothing to backfill
+
+        today = datetime.date.today()
+        today_dir = today.strftime("%Y%m%d")
+        for days_back in range(max_days_back + 1):
+            target_date = today - datetime.timedelta(days=days_back)
+            day_prefix = target_date.strftime("%d")
+            log_path = os.path.join(
+                backup_root, machine_id, today_dir,
+                "{}TX1.Log".format(day_prefix),
+            )
+
+            if not os.path.exists(log_path):
+                continue
+
+            last_wo = None
+            last_side = None
+            last_ts = None
+            try:
+                with open(log_path, "r", encoding="cp932", errors="replace") as f:
+                    for line in f:
+                        event = parse_fileoperation_line(line.strip())
+                        if event:
+                            # Skip events from previous months (stale file)
+                            try:
+                                event_date = datetime.datetime.fromisoformat(
+                                    event["timestamp"].split(".")[0]
+                                ).date()
+                                if (today - event_date).days > max_days_back + 2:
+                                    continue
+                            except (ValueError, TypeError):
+                                continue
+                            wo, side = extract_work_order(event["program_name"])
+                            if wo:
+                                last_wo = wo
+                                last_side = side
+                                last_ts = event["timestamp"]
+            except Exception as e:
+                logger.error(
+                    "[%s] TX1 backfill read error (%s): %s",
+                    machine_id, log_path, e,
+                )
+                continue
+
+            if last_wo:
+                conn.execute(
+                    "UPDATE machine_current_state SET work_order=?, work_order_side=? "
+                    "WHERE machine_id=?",
+                    (last_wo, last_side, machine_id),
+                )
+                conn.commit()
+                logger.info(
+                    "[%s] TX1 backfill: recovered work order %s.%s from %s (at %s)",
+                    machine_id, last_wo, last_side, os.path.basename(log_path), last_ts,
+                )
+                return
+
+        logger.info(
+            "[%s] TX1 backfill: no production work order found in last %d days",
+            machine_id, max_days_back,
+        )
     finally:
         conn.close()
 
@@ -176,6 +288,7 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
 
     today = datetime.date.today()
     day_prefix = today.strftime("%d")
+    backup_root = get_backup_root(settings)
 
     logger.info("TX1 parser cycle start: %d Takeuchi machines, day_prefix=%s",
                 len(takeuchi_machines), day_prefix)
@@ -188,5 +301,12 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
             parse_tx1_file(db_path, machine_id, log_path, day_prefix)
         except Exception as e:
             logger.error("[%s] TX1 parser error: %s", machine_id, e, exc_info=True)
+
+        # If work_order is still NULL after normal parsing, scan further
+        # back in the backup folders to recover it (DB recreation safety net).
+        try:
+            backfill_work_order(db_path, machine_id, backup_root)
+        except Exception as e:
+            logger.error("[%s] TX1 backfill error: %s", machine_id, e, exc_info=True)
 
     logger.info("TX1 parser cycle complete.")

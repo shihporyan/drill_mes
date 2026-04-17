@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import logging
 import os
 import re
@@ -108,9 +109,15 @@ def _backfill_takeuchi(db_path, machine_id, machine_dir, target_date):
             tx1_filename = "{}TX1.Log".format(day_prefix)
             tx1_path = os.path.join(date_path, tx1_filename)
             if os.path.exists(tx1_path):
+                # Compute reference_date from date_dir year-month + day_prefix
+                try:
+                    dir_date = datetime.datetime.strptime(date_dir, "%Y%m%d").date()
+                    ref_date = dir_date.replace(day=int(day_prefix))
+                except ValueError:
+                    ref_date = dir_date
                 try:
                     logger.info("[%s] Parsing %s/%s", machine_id, date_dir, tx1_filename)
-                    parse_tx1_file(db_path, machine_id, tx1_path, day_prefix)
+                    parse_tx1_file(db_path, machine_id, tx1_path, day_prefix, reference_date=ref_date)
                 except Exception as e:
                     logger.error("[%s] Error parsing %s: %s", machine_id, tx1_filename, e, exc_info=True)
 

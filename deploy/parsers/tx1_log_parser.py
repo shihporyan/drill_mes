@@ -62,7 +62,7 @@ def parse_fileoperation_line(line):
     return {"timestamp": iso_ts, "program_name": program_name}
 
 
-def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
+def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=None):
     """Parse TX1.Log incrementally and update work order in machine_current_state.
 
     Args:
@@ -70,6 +70,9 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
         machine_id: Machine identifier (e.g. 'M13').
         log_path: Full path to the TX1.Log file.
         day_prefix: Two-digit day string (e.g. '10').
+        reference_date: Expected date for this file's events. Events more than
+            2 days before this date are skipped (stale previous-month data).
+            Defaults to today.
     """
     if not os.path.exists(log_path):
         return
@@ -105,11 +108,24 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix):
             if event:
                 events.append(event)
 
-        # Find last production program in new events
+        # Find last production program in new events.
+        # Filter out events from previous months — TX1.Log files are
+        # monthly-rotating ({DD}TX1.Log), so at midnight the file for
+        # today's day_prefix may still contain last month's data until
+        # the machine overwrites it.
+        ref_date = reference_date or datetime.date.today()
         last_wo = None
         last_side = None
         last_ts = None
         for event in events:
+            try:
+                event_date = datetime.datetime.fromisoformat(
+                    event["timestamp"].split(".")[0]
+                ).date()
+                if (ref_date - event_date).days > 2:
+                    continue  # Skip stale previous-month data
+            except (ValueError, TypeError):
+                continue
             wo, side = extract_work_order(event["program_name"])
             if wo:
                 last_wo = wo
@@ -196,6 +212,15 @@ def backfill_work_order(db_path, machine_id, backup_root, max_days_back=7):
                     for line in f:
                         event = parse_fileoperation_line(line.strip())
                         if event:
+                            # Skip events from previous months (stale file)
+                            try:
+                                event_date = datetime.datetime.fromisoformat(
+                                    event["timestamp"].split(".")[0]
+                                ).date()
+                                if (today - event_date).days > max_days_back + 2:
+                                    continue
+                            except (ValueError, TypeError):
+                                continue
                             wo, side = extract_work_order(event["program_name"])
                             if wo:
                                 last_wo = wo
@@ -290,14 +315,16 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
         )
         yesterday_progress_key = "tx1_{}".format(yesterday_prefix)
         try:
-            parse_tx1_file(db_path, machine_id, yesterday_path, yesterday_prefix)
+            parse_tx1_file(db_path, machine_id, yesterday_path, yesterday_prefix,
+                           reference_date=yesterday)
         except Exception as e:
             logger.error("[%s] TX1 parser error (prev-day): %s", machine_id, e, exc_info=True)
 
         # Parse today's TX1.Log
         log_path = get_tx1_log_path(settings, machine_id, day_prefix)
         try:
-            parse_tx1_file(db_path, machine_id, log_path, day_prefix)
+            parse_tx1_file(db_path, machine_id, log_path, day_prefix,
+                           reference_date=today)
         except Exception as e:
             logger.error("[%s] TX1 parser error: %s", machine_id, e, exc_info=True)
 

@@ -354,26 +354,6 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                 })
             prev_state = row["state"]
 
-        # ---- Track last production program for work order ----
-        last_wo = None
-        last_wo_side = None
-        for row in parsed_rows:
-            wo, side = extract_work_order(row["program"])
-            if wo:
-                last_wo = wo
-                last_wo_side = side
-
-        # If no production program found in this batch, keep existing WO
-        if last_wo is None:
-            cursor = conn.execute(
-                "SELECT work_order, work_order_side FROM machine_current_state WHERE machine_id=?",
-                (machine_id,),
-            )
-            existing = cursor.fetchone()
-            if existing:
-                last_wo = existing[0]
-                last_wo_side = existing[1]
-
         # ---- Write to database ----
 
         # If file was overwritten, clear old data for affected dates
@@ -453,18 +433,15 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
 
         conn.execute(
             "INSERT INTO machine_current_state "
-            "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter, "
-            "work_order, work_order_side) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(machine_id) DO UPDATE SET "
             "state=excluded.state, mode=excluded.mode, program=excluded.program, "
             "tool_num=excluded.tool_num, drill_dia=excluded.drill_dia, "
-            "since=excluded.since, last_update=excluded.last_update, counter=excluded.counter, "
-            "work_order=excluded.work_order, work_order_side=excluded.work_order_side",
+            "since=excluded.since, last_update=excluded.last_update, counter=excluded.counter",
             (machine_id, last_row["state"], last_row["mode"], last_row["program"],
              last_row["tool_num"], last_row["drill_dia"], since,
-             last_row["iso_timestamp"], last_row["counter"],
-             last_wo, last_wo_side),
+             last_row["iso_timestamp"], last_row["counter"]),
         )
 
         # Update parse progress
