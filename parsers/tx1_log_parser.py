@@ -162,7 +162,7 @@ def backfill_work_order(db_path, machine_id, backup_root, max_days_back=7):
     the normal today + yesterday parse path).
 
     Scans today's backup folder for older day_prefix files. Because
-    robocopy copies the entire `\LOG\` directory each cycle, today's
+    robocopy copies the entire LOG directory each cycle, today's
     folder contains the freshest copy of every `{DD}TX1.Log` file
     (including older days that were closed out at their month-end).
     Iterates day_prefix from today backward through `max_days_back`
