@@ -19,7 +19,7 @@
 const { useState, useEffect, useCallback, useRef } = React;
 
 // ============ CONFIG ============
-const REFRESH_INTERVAL = 600; // seconds (10 min)
+const REFRESH_INTERVAL = 60; // seconds
 const API_BASE = window.location.origin;
 const TARGET = 75;
 const COLOR_DRILL = "#059669";
@@ -126,7 +126,6 @@ function Header({tab, setTab, countdown, apiOk}) {
     {key:"overview", label:"機台總覽"},
     {key:"ranking",  label:"稼動排行"},
     {key:"analysis", label:"稼動分析"},
-    {key:"detail",   label:"作業細節"},
   ];
   return (
     <div style={{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"0 28px",position:"sticky",top:0,zIndex:10}}>
@@ -783,13 +782,11 @@ function Dashboard() {
     try {
       const data = await fetchOverview();
       setOverviewData(data);
-      // Align countdown with backend cycle (clock-skew safe)
-      if (data && data.next_cycle_at && data.timestamp) {
-        const serverNow = new Date(data.timestamp).getTime();
-        const nextCycle = new Date(data.next_cycle_at).getTime();
-        const remaining = Math.floor((nextCycle - serverNow) / 1000);
-        if (remaining > 0) setCd(remaining);
-      }
+      // Frontend refreshes every REFRESH_INTERVAL (60s) independently of
+      // the backend parser cycle (10 min). The overview API computes
+      // duration live on each call, so a 60s frontend poll keeps the
+      // "持續時間" field visibly ticking. State changes still appear at
+      // the backend cycle boundary.
       // Check if we got real API data by trying the fetch directly
       try {
         await apiFetch("/api/drilling/overview");
