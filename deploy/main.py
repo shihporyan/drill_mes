@@ -33,6 +33,7 @@ from parsers.base_parser import load_settings, load_machines_config, get_db_path
 from parsers.drive_log_parser import run_parser_cycle, run_parser_loop
 from parsers.tx1_log_parser import run_parser_cycle as run_tx1_parser_cycle
 from parsers.laser_log_parser import run_parser_cycle as run_laser_parser_cycle
+from parsers.mtime_observer import start_observer_thread as start_mtime_observer
 from collector.log_collector import run_collection_cycle, run_collection_loop
 from collector.laser_log_collector import run_collection_cycle as run_laser_collection_cycle
 from server.api_server import run_server
@@ -211,6 +212,14 @@ def run_all():
     )
     worker.start()
     logger.info("Collector+Parser thread started")
+
+    # Start high-frequency TX1 mtime observer (investigation layer, see
+    # notes/tx1_flush_latency_investigation.md). 30s poll, very light.
+    try:
+        start_mtime_observer(db_path=db_path, settings=settings, machines_config=machines_config)
+        logger.info("TX1 mtime observer thread started (30s interval)")
+    except Exception as e:
+        logger.warning("Failed to start TX1 mtime observer: %s", e)
 
     # Run API server in main thread (blocking)
     host = settings.get("http_host", "127.0.0.1")

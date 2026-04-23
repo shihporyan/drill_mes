@@ -61,3 +61,6 @@ npm run test:e2e:ui
 - [notes/laser_board_identification.md](notes/laser_board_identification.md) — 雷鑽 `.lsr` 宣告夾帶板名的可行性
 - [notes/work_detail_fields_investigation.md](notes/work_detail_fields_investigation.md) — 作業細節欄位調查（已完成）
 - [notes/work_detail_fields_plan.md](notes/work_detail_fields_plan.md) — 作業細節欄位規劃（機械鑽孔，討論中）
+- [notes/m13_firmware_gap_investigation.md](notes/m13_firmware_gap_investigation.md) — M13 Drive.Log 時間跳躍/倒退現象
+- [notes/tx1_flush_latency_investigation.md](notes/tx1_flush_latency_investigation.md) — TX1.Log flush 延遲調查計畫 + 4/20 兩次測試結果（state 轉態驅動 flush 已驗證）
+- [notes/tx1_transition_triggered_parse_plan.md](notes/tx1_transition_triggered_parse_plan.md) — Layer 2 優化規劃：state 轉態觸發 TX1 parse，預期工單切換偵測壓到 <5 min

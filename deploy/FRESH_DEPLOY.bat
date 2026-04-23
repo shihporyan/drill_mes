@@ -1,15 +1,21 @@
 @echo off
 REM =====================================================
 REM  Drill Monitor - Fresh Deploy Script
-REM  在 Windows 運算電腦上執行
-REM  前提：Python 3.8+ 已安裝並在 PATH 中
+REM  Run on the Windows compute PC.
+REM  Prereq: Python 3.8+ installed and in PATH.
 REM =====================================================
+
+REM Change to the directory where this script lives.
+REM Without this, "python db\init_db.py" would resolve against
+REM whatever cwd the user launched us from (often System32).
+cd /d "%~dp0"
 
 echo.
 echo === Drill Monitor Fresh Deploy ===
+echo Working dir: %CD%
 echo.
 
-REM --- Step 1: 確認 Python ---
+REM --- Step 1: verify Python ---
 python --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python not found in PATH
@@ -19,14 +25,14 @@ if errorlevel 1 (
 )
 python --version
 
-REM --- Step 2: 停止舊的程序 ---
+REM --- Step 2: stop running processes ---
 echo.
 echo [Step 2] Stopping any running drill_monitor processes...
 taskkill /F /FI "WINDOWTITLE eq DrillMonitor" >nul 2>&1
 REM Give processes time to close
 timeout /t 2 /nobreak >nul
 
-REM --- Step 3: 刪除舊的 DB 和 LOG ---
+REM --- Step 3: remove old DB and logs ---
 echo.
 echo [Step 3] Removing old database and log files...
 if exist drill_monitor.db (
@@ -50,12 +56,12 @@ if exist drill_monitor.log.1 (
     echo   Deleted: drill_monitor.log backups
 )
 
-REM --- Step 4: 初始化新的 DB ---
+REM --- Step 4: init fresh DB ---
 echo.
 echo [Step 4] Initializing fresh database...
 python db\init_db.py
 
-REM --- Step 5: 確認 backup_root 目錄存在 ---
+REM --- Step 5: ensure backup_root exists ---
 echo.
 echo [Step 5] Ensuring backup directory exists...
 if not exist "C:\DrillLogs" (
@@ -65,12 +71,12 @@ if not exist "C:\DrillLogs" (
     echo   OK: C:\DrillLogs exists
 )
 
-REM --- Step 6: 跑 parser 測試 ---
+REM --- Step 6: run parser tests ---
 echo.
 echo [Step 6] Running parser tests...
 python -m unittest tests.test_parser_accuracy -v
 
-REM --- Step 7: 檢查機台連線 ---
+REM --- Step 7: machine connectivity check ---
 echo.
 echo [Step 7] Checking machine connectivity...
 python collector\health_check.py

@@ -429,6 +429,118 @@ class TestParserWithGappedData(unittest.TestCase):
                          "Hour 11 should get 9s (from gap) + 1s (last row)")
 
 
+class TestParserPeekAheadReplay(unittest.TestCase):
+    """Test that cross-batch peek-ahead replay does not double-count.
+
+    Scenario: firmware writes a future-timestamped "peek-ahead" row to the
+    log (e.g. at 10:00:30), then in a later flush writes the real rows that
+    fill in the earlier timestamps (10:00:05, :06, :07, :08). When the
+    parser runs twice (once before and once after the fill-in), the second
+    batch's rows have timestamps earlier than the last_timestamp recorded
+    by the first batch. Without handling this, hourly_utilization is
+    over-counted and state_transitions contain duplicates.
+    """
+
+    DATE_STR = "2026/04/10"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "10Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, time_str, state, counter):
+        """Format one Drive.Log CSV row."""
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=self.DATE_STR, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _write(self, rows):
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def test_peek_ahead_replay_does_not_double_count(self):
+        """Two parse calls with peek-ahead fill-in should total same as one parse."""
+        # Batch 1: real rows 10:00:00-04 (RUN) + peek-ahead at 10:00:30 (RUN).
+        # Counter increments monotonically: 100..104 for real rows, 130 for
+        # peek-ahead (simulating firmware projecting forward).
+        batch1_rows = [
+            self._row("10:00:00", "RUN", 100),
+            self._row("10:00:01", "RUN", 101),
+            self._row("10:00:02", "RUN", 102),
+            self._row("10:00:03", "RUN", 103),
+            self._row("10:00:04", "RUN", 104),
+            self._row("10:00:30", "RUN", 130),
+        ]
+        self._write(batch1_rows)
+        parse_log_file(self.db_path, "M13", self.log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            after_batch1 = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+        self.assertIsNotNone(after_batch1, "Batch 1 should produce hour-10 row")
+
+        # Batch 2: same file + filler rows 10:00:05-08 appended AFTER the
+        # peek-ahead line (firmware writes real rows later) + next real row
+        # at 10:00:31. The filler timestamps are earlier than the peek-ahead.
+        batch2_rows = batch1_rows + [
+            self._row("10:00:05", "RUN", 105),
+            self._row("10:00:06", "RUN", 106),
+            self._row("10:00:07", "RUN", 107),
+            self._row("10:00:08", "RUN", 108),
+            self._row("10:00:31", "RUN", 131),
+        ]
+        self._write(batch2_rows)
+        parse_log_file(self.db_path, "M13", self.log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            run_sec, holes = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+            trans_count = conn.execute(
+                "SELECT COUNT(*) FROM state_transitions WHERE machine_id='M13'"
+            ).fetchone()[0]
+            dup_count = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM state_transitions "
+                "WHERE machine_id='M13' GROUP BY timestamp HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+
+        # Oracle: parse the final file once from a clean DB.
+        oracle_db = os.path.join(self.temp_dir, "oracle.db")
+        init_database(oracle_db)
+        parse_log_file(oracle_db, "M13", self.log_path, "10")
+        with sqlite3.connect(oracle_db) as conn:
+            oracle_run, oracle_holes = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+
+        self.assertEqual(run_sec, oracle_run,
+                         "Two-batch parse with replay should match single-pass parse "
+                         "(got run_seconds={}, oracle={})".format(run_sec, oracle_run))
+        self.assertEqual(holes, oracle_holes,
+                         "Hole count should match single-pass parse "
+                         "(got {}, oracle {})".format(holes, oracle_holes))
+        self.assertEqual(dup_count, 0,
+                         "No duplicate state_transitions should exist after replay "
+                         "(found {} duplicated timestamps)".format(dup_count))
+        self.assertLessEqual(run_sec, 3600,
+                             "Hour total cannot exceed 3600s, got {}".format(run_sec))
+
+
 class TestParserWithFixture(unittest.TestCase):
     """Test parser accuracy using real fixture file (if available)."""
 

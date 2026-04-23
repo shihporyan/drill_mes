@@ -71,6 +71,11 @@ def init_database(db_path=None):
 
     schema_sql = get_schema_sql()
 
+    # Pre-migration: dedupe state_transitions so the UNIQUE index in
+    # schema.sql can be created without failing on existing duplicates
+    # (left behind by the peek-ahead replay bug before its fix).
+    _dedupe_state_transitions_pre_schema(db_path)
+
     with sqlite3.connect(db_path) as conn:
         conn.executescript(schema_sql)
         logger.info("Database initialized: %s", db_path)
@@ -87,6 +92,45 @@ def init_database(db_path=None):
         logger.info("Tables created: %s", ", ".join(tables))
 
     return db_path
+
+
+def _dedupe_state_transitions_pre_schema(db_path):
+    """Dedupe state_transitions before applying schema.sql.
+
+    The schema now declares `UNIQUE(machine_id, timestamp)` on
+    state_transitions, so a `CREATE UNIQUE INDEX IF NOT EXISTS` against a
+    table that already contains duplicates will raise IntegrityError.
+    This happens on production DBs from before the peek-ahead replay fix
+    (~13 known duplicate rows as of 2026-04-23).
+
+    We keep the lowest id per (machine_id, timestamp) and drop the rest.
+    If the state_transitions table doesn't exist yet (fresh DB), this is
+    a no-op.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='state_transitions'"
+            )
+            if not cursor.fetchone():
+                return  # fresh DB, nothing to dedupe
+            deleted = conn.execute("""
+                DELETE FROM state_transitions WHERE id NOT IN (
+                    SELECT MIN(id) FROM state_transitions
+                    GROUP BY machine_id, timestamp
+                )
+            """).rowcount
+            if deleted:
+                logger.warning(
+                    "Pre-schema migration: removed %d duplicate state_transitions rows "
+                    "(peek-ahead replay bug artifacts). hourly_utilization may still be "
+                    "over-counted for those dates — run a manual re-parse if you need "
+                    "historical accuracy.",
+                    deleted,
+                )
+    except sqlite3.Error as e:
+        logger.error("Pre-schema dedupe failed: %s", e)
 
 
 def _run_migrations(db_path):

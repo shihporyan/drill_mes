@@ -34,6 +34,7 @@ from parsers.base_parser import (
     update_parse_progress,
 )
 from parsers.drive_log_parser import extract_work_order
+from parsers.flush_observer import observe_takeuchi_logs
 
 logger = logging.getLogger(__name__)
 
@@ -114,19 +115,37 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=Non
         # today's day_prefix may still contain last month's data until
         # the machine overwrites it.
         ref_date = reference_date or datetime.date.today()
+        detected_at_iso = datetime.datetime.now().isoformat()
         last_wo = None
         last_side = None
         last_ts = None
         for event in events:
             try:
-                event_date = datetime.datetime.fromisoformat(
-                    event["timestamp"].split(".")[0]
-                ).date()
+                event_dt = datetime.datetime.fromisoformat(event["timestamp"])
+                event_date = event_dt.date()
                 if (ref_date - event_date).days > 2:
                     continue  # Skip stale previous-month data
             except (ValueError, TypeError):
                 continue
             wo, side = extract_work_order(event["program_name"])
+
+            # Record flush-latency sample for every FILEOPERATION LOAD event
+            # (see notes/tx1_flush_latency_investigation.md). Both WO-matching
+            # and non-matching events (e.g. O100.txt) are useful samples.
+            try:
+                delay_sec = (
+                    datetime.datetime.fromisoformat(detected_at_iso) - event_dt
+                ).total_seconds()
+                conn.execute(
+                    "INSERT OR IGNORE INTO tx1_event_latency "
+                    "(machine_id, event_ts, detected_at, delay_seconds, "
+                    "program_name, wo_matched) VALUES (?, ?, ?, ?, ?, ?)",
+                    (machine_id, event["timestamp"], detected_at_iso, delay_sec,
+                     event["program_name"], 1 if wo else 0),
+                )
+            except Exception as e:
+                logger.warning("[%s] Failed to record tx1 latency: %s", machine_id, e)
+
             if wo:
                 last_wo = wo
                 last_side = side
@@ -307,6 +326,15 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
 
     for machine in takeuchi_machines:
         machine_id = machine["id"]
+        machine_ip = machine.get("ip")
+
+        # Observe remote log file metadata (6 types) for flush-latency
+        # investigation. Runs once per cycle per machine.
+        if machine_ip:
+            try:
+                observe_takeuchi_logs(db_path, machine_id, machine_ip, day_prefix)
+            except Exception as e:
+                logger.error("[%s] flush_observer error: %s", machine_id, e, exc_info=True)
 
         # Parse yesterday's TX1.Log from today's backup (catches late-night events)
         yesterday_path = os.path.join(

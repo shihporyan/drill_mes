@@ -264,6 +264,59 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
             deduped.append(row)
         parsed_rows = deduped
 
+        # ---- Peek-ahead replay detection ----
+        # If this batch's earliest row is older than the last_timestamp we
+        # recorded in the previous batch, then that previous batch parsed
+        # "peek-ahead" rows from the firmware (future-timestamped rows written
+        # before the real rows for that time window had been flushed). The
+        # current batch contains the real rows filling in that window.
+        #
+        # Without intervention we would: (a) double-count seconds between the
+        # overlapping time window, (b) insert duplicate state_transitions, and
+        # (c) over-count hole deltas in the same window.
+        #
+        # Fix: treat the situation like a file overwrite — re-read the entire
+        # file from line 0, clear existing hourly + transitions for the
+        # affected dates, and rebuild from scratch.
+        if last_line > 0 and parsed_rows:
+            cursor = conn.execute(
+                "SELECT last_timestamp FROM parse_progress "
+                "WHERE machine_id=? AND day_prefix=?",
+                (machine_id, day_prefix),
+            )
+            row = cursor.fetchone()
+            prev_last_ts = row[0] if row else None
+            if prev_last_ts and parsed_rows[0]["iso_timestamp"] < prev_last_ts:
+                logger.warning(
+                    "[%s] Peek-ahead replay on day=%s: batch earliest=%s < "
+                    "prev last_timestamp=%s. Re-parsing file from line 0.",
+                    machine_id, day_prefix,
+                    parsed_rows[0]["iso_timestamp"], prev_last_ts,
+                )
+                # Reset state to force full re-parse + cleanup downstream.
+                overwritten = True
+                last_line = 0
+                new_lines = all_lines
+                parsed_rows = []
+                for line in new_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = parse_csv_line(line)
+                    if r is not None:
+                        parsed_rows.append(r)
+                # Re-sort + dedup after re-parse.
+                for idx, rr in enumerate(parsed_rows):
+                    rr["_file_order"] = idx
+                parsed_rows.sort(key=lambda r: (r["datetime"], r["_file_order"]))
+                deduped = []
+                for i, rr in enumerate(parsed_rows):
+                    if (i + 1 < len(parsed_rows)
+                            and parsed_rows[i + 1]["datetime"] == rr["datetime"]):
+                        continue
+                    deduped.append(rr)
+                parsed_rows = deduped
+
         # ---- Get previous state for incremental delta + transitions ----
         cursor = conn.execute(
             "SELECT state FROM machine_current_state WHERE machine_id=?",
@@ -397,10 +450,12 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                  total, util, bucket["hole_count"]),
             )
 
-        # INSERT state transitions
+        # INSERT state transitions. OR IGNORE relies on
+        # UNIQUE(machine_id, timestamp) to drop duplicates from peek-ahead
+        # replay (B1 also handles the root cause, this is defense in depth).
         for t in transitions:
             conn.execute(
-                "INSERT INTO state_transitions "
+                "INSERT OR IGNORE INTO state_transitions "
                 "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (t["machine_id"], t["timestamp"], t["from_state"], t["to_state"],

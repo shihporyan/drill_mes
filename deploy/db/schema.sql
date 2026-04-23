@@ -86,7 +86,56 @@ CREATE TABLE IF NOT EXISTS system_status (
     value TEXT
 );
 
+-- ===== Flush Latency Instrumentation =====
+-- See notes/tx1_flush_latency_investigation.md
+
+-- Per-event TX1 FILEOPERATION LOAD detection latency
+CREATE TABLE IF NOT EXISTS tx1_event_latency (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id     TEXT NOT NULL,
+    event_ts       TEXT NOT NULL,      -- timestamp inside log line
+    detected_at    TEXT NOT NULL,      -- server time when parser first saw it
+    delay_seconds  REAL NOT NULL,      -- detected_at - event_ts
+    program_name   TEXT,               -- NAME:[...] content
+    wo_matched     INTEGER NOT NULL,   -- 0/1 passes WO_PATTERN
+    UNIQUE(machine_id, event_ts, program_name)
+);
+
+-- Per-cycle size/mtime snapshot of each remote log file type (6 types for Takeuchi)
+CREATE TABLE IF NOT EXISTS log_file_observe (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id   TEXT NOT NULL,
+    log_type     TEXT NOT NULL,   -- 'Drive','TX1','MACRO','TARN','FILE','Alarm'
+    observed_at  TEXT NOT NULL,
+    file_size    INTEGER,
+    file_mtime   TEXT,
+    error        TEXT             -- non-null when stat failed
+);
+
+-- High-frequency (30s) TX1.Log mtime CHANGE events. Only inserts when the
+-- mtime observed via SMB actually advances, so the table stays small and
+-- each row represents "a flush was visible on SMB at this time."
+-- Used to validate the hypothesis that state transitions trigger TX1 flushes
+-- (cross-join with state_transitions to measure transition→flush latency).
+CREATE TABLE IF NOT EXISTS tx1_mtime_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id   TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,    -- server time when change first detected
+    new_mtime    TEXT NOT NULL,    -- SMB-reported mtime after the change
+    size_delta   INTEGER,          -- bytes added since previous mtime
+    new_size     INTEGER,
+    UNIQUE(machine_id, new_mtime)
+);
+
 -- ===== Indexes =====
 CREATE INDEX IF NOT EXISTS idx_hourly_date ON hourly_utilization(date);
 CREATE INDEX IF NOT EXISTS idx_transitions_ts ON state_transitions(machine_id, timestamp);
+-- Unique index: prevents duplicate transitions when a Drive.Log batch re-parses
+-- a timestamp window already seen in a previous batch (firmware peek-ahead replay).
+-- Paired with INSERT OR IGNORE in drive_log_parser.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_transitions_machine_ts
+    ON state_transitions(machine_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_laser_wo_machine ON laser_work_orders(machine_id, start_time);
+CREATE INDEX IF NOT EXISTS idx_tx1_latency_machine ON tx1_event_latency(machine_id, detected_at);
+CREATE INDEX IF NOT EXISTS idx_log_observe_machine ON log_file_observe(machine_id, log_type, observed_at);
+CREATE INDEX IF NOT EXISTS idx_tx1_mtime_machine ON tx1_mtime_events(machine_id, observed_at);
