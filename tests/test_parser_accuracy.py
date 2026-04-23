@@ -541,6 +541,144 @@ class TestParserPeekAheadReplay(unittest.TestCase):
                              "Hour total cannot exceed 3600s, got {}".format(run_sec))
 
 
+class TestParserCrossMidnightReplay(unittest.TestCase):
+    """Test that peek-ahead replay in a file with cross-midnight rows does
+    NOT wipe prior-day data.
+
+    Scenario: 23Drive.Log starts with a handful of 22-dated rows (firmware
+    buffer flushing past midnight) followed by 23-dated rows. If a peek-
+    ahead replay triggers a full re-parse of 23Drive.Log, we must only
+    rebuild 23's hourly_utilization and leave 22's data (owned by
+    22Drive.Log's own parse) untouched.
+
+    Bug: before this fix, the DELETE step wiped hourly rows for every date
+    appearing in 23Drive.Log's parsed rows. That destroyed 22's data, then
+    re-attributed only a few stray cross-midnight seconds back — severe
+    undercount on the prior day.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "23Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, date_str, time_str, state, counter):
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=date_str, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _write(self, rows):
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def _seed_prior_day(self):
+        """Put realistic 22nd-of-month hourly data into DB (as if 22Drive.Log
+        had already been parsed). Hour 23 has 3500s RUN, 100 holes."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO hourly_utilization "
+                "(machine_id, date, hour, run_seconds, reset_seconds, "
+                "stop_seconds, total_seconds, utilization, hole_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("M13", "2026-04-22", 23, 3500, 100, 0, 3600, 97.2, 100),
+            )
+            conn.commit()
+
+    def test_replay_preserves_prior_day_hourly(self):
+        # Simulate real production: 22's hourly row is already in DB.
+        self._seed_prior_day()
+
+        # 23Drive.Log: 3 cross-midnight rows from 22 (23:59:57/58/59), then
+        # 23-dated rows with a peek-ahead at 00:00:30, then a filler batch.
+        batch1 = [
+            self._row("2026/04/22", "23:59:57", "RUN", 50),
+            self._row("2026/04/22", "23:59:58", "RUN", 51),
+            self._row("2026/04/22", "23:59:59", "RUN", 52),
+            self._row("2026/04/23", "00:00:00", "RUN", 53),
+            self._row("2026/04/23", "00:00:01", "RUN", 54),
+            self._row("2026/04/23", "00:00:02", "RUN", 55),
+            self._row("2026/04/23", "00:00:03", "RUN", 56),
+            self._row("2026/04/23", "00:00:04", "RUN", 57),
+            self._row("2026/04/23", "00:00:30", "RUN", 83),  # peek-ahead
+        ]
+        self._write(batch1)
+        parse_log_file(self.db_path, "M13", self.log_path, "23")
+
+        # Snapshot 22's hour-23 after batch 1 (cross-midnight rows were
+        # legitimately attributed to 22 via UPSERT += in the normal
+        # incremental path). This is the value the replay must NOT disturb.
+        with sqlite3.connect(self.db_path) as conn:
+            prior_after_b1 = conn.execute(
+                "SELECT run_seconds, reset_seconds, stop_seconds, "
+                "total_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-22' AND hour=23"
+            ).fetchone()
+        self.assertIsNotNone(prior_after_b1, "Batch 1 should leave 22 hour 23 intact")
+        self.assertGreaterEqual(prior_after_b1[0], 3500,
+                                "Sanity: 22 hour 23 RUN should be at least seed value")
+
+        # Batch 2: append fill-in rows earlier than the peek-ahead → replay.
+        batch2 = batch1 + [
+            self._row("2026/04/23", "00:00:05", "RUN", 58),
+            self._row("2026/04/23", "00:00:06", "RUN", 59),
+            self._row("2026/04/23", "00:00:07", "RUN", 60),
+            self._row("2026/04/23", "00:00:08", "RUN", 61),
+            self._row("2026/04/23", "00:00:31", "RUN", 84),
+        ]
+        self._write(batch2)
+        parse_log_file(self.db_path, "M13", self.log_path, "23")
+
+        with sqlite3.connect(self.db_path) as conn:
+            prior_after_b2 = conn.execute(
+                "SELECT run_seconds, reset_seconds, stop_seconds, "
+                "total_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-22' AND hour=23"
+            ).fetchone()
+            today_hour0 = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-23' AND hour=0"
+            ).fetchone()
+
+        # The replay-driven full re-parse of 23Drive.Log must NOT touch 22's
+        # hourly row (which is owned by 22Drive.Log's parse). Without the
+        # fix, the DELETE step wiped all dates in parsed_rows → 22's 3500+
+        # seed would be destroyed and only the 3 cross-midnight seconds
+        # would remain.
+        self.assertIsNotNone(prior_after_b2, "Prior day (22) hour-23 row must still exist")
+        self.assertEqual(prior_after_b2, prior_after_b1,
+                         "Replay must not modify prior-day hourly row "
+                         "(before={}, after={})".format(prior_after_b1, prior_after_b2))
+
+        # Today's hour-0 data should match single-pass oracle on same file.
+        oracle_db = os.path.join(self.temp_dir, "oracle.db")
+        init_database(oracle_db)
+        parse_log_file(oracle_db, "M13", self.log_path, "23")
+        with sqlite3.connect(oracle_db) as conn:
+            oracle = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-23' AND hour=0"
+            ).fetchone()
+
+        self.assertIsNotNone(today_hour0, "Today's hour-0 row must exist")
+        self.assertEqual(today_hour0[0], oracle[0],
+                         "Today RUN after replay should match oracle "
+                         "(got {}, oracle {})".format(today_hour0[0], oracle[0]))
+        self.assertEqual(today_hour0[1], oracle[1],
+                         "Today hole_count after replay should match oracle "
+                         "(got {}, oracle {})".format(today_hour0[1], oracle[1]))
+
+
 class TestParserWithFixture(unittest.TestCase):
     """Test parser accuracy using real fixture file (if available)."""
 

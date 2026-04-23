@@ -317,6 +317,15 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                     deduped.append(rr)
                 parsed_rows = deduped
 
+        # If this is a full re-parse (overwritten or replay), drop any
+        # cross-midnight rows that belong to a different date than this
+        # file's day_prefix. Attribution for those dates comes from the
+        # neighbouring file; accumulating them here via UPSERT += would
+        # double-count.
+        if overwritten and parsed_rows:
+            parsed_rows = [r for r in parsed_rows
+                           if r["iso_timestamp"][8:10] == day_prefix]
+
         # ---- Get previous state for incremental delta + transitions ----
         cursor = conn.execute(
             "SELECT state FROM machine_current_state WHERE machine_id=?",
@@ -409,9 +418,12 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
 
         # ---- Write to database ----
 
-        # If file was overwritten, clear old data for affected dates
+        # If file was overwritten (monthly rotation) or a peek-ahead replay
+        # was detected, clear old data for this file's primary date. Cross-
+        # midnight rows were already filtered out above, so parsed_rows only
+        # contains dates this file owns.
         if overwritten:
-            dates_in_log = set(r["date"] for r in parsed_rows)
+            dates_in_log = {r["date"] for r in parsed_rows}
             for d in dates_in_log:
                 conn.execute(
                     "DELETE FROM hourly_utilization WHERE machine_id=? AND date=?",
