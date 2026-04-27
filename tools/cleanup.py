@@ -12,6 +12,7 @@ Usage:
 import logging
 import os
 import shutil
+import stat
 import sys
 import time
 
@@ -21,6 +22,20 @@ sys.path.insert(0, PROJECT_ROOT)
 from parsers.base_parser import load_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _force_writable_then_retry(func, path, exc_info):
+    """rmtree onerror callback: clear read-only bit and retry.
+
+    SMB-copied .Log files often arrive with the read-only attribute, which
+    causes shutil.rmtree to fail with WinError 5 on Windows even though the
+    user has full perms. Strip the bit and retry.
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception as e:
+        logger.error("Failed to delete %s after chmod: %s", path, e)
 
 
 def cleanup_old_backups(dry_run=True, settings=None):
@@ -67,7 +82,10 @@ def cleanup_old_backups(dry_run=True, settings=None):
                     logger.info("[DRY RUN] Would delete: %s (%d days old)", date_path, age_days)
                 else:
                     try:
-                        shutil.rmtree(date_path)
+                        shutil.rmtree(date_path, onerror=_force_writable_then_retry)
+                        if os.path.exists(date_path):
+                            logger.error("Failed to delete %s (still exists after rmtree)", date_path)
+                            continue
                         logger.info("Deleted: %s (%d days old)", date_path, age_days)
                     except Exception as e:
                         logger.error("Failed to delete %s: %s", date_path, e)
