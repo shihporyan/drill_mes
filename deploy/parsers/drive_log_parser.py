@@ -210,9 +210,12 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
         if overwritten:
             last_line = 0
 
-        # Read all lines from file
+        # Read all lines from file. Use errors='replace' so a single bad byte
+        # (occasional SMB transfer corruption or firmware glitch) doesn't make
+        # the entire file unparseable for the rest of the day. Affected line
+        # falls through parse_csv_line and gets skipped.
         try:
-            with open(log_path, "r", encoding="utf-8") as f:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
         except Exception as e:
             logger.error("[%s] Failed to read %s: %s", machine_id, log_path, e)
@@ -422,6 +425,10 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
         # was detected, clear old data for this file's primary date. Cross-
         # midnight rows were already filtered out above, so parsed_rows only
         # contains dates this file owns.
+        # No commit here — DELETE + UPSERT must land in a single transaction
+        # so dashboard reads never see the brief window where the day's data
+        # has been wiped but not yet rebuilt. (Replay can fire on 5 machines
+        # per cycle in production, every 10 min, so the window is hit often.)
         if overwritten:
             dates_in_log = {r["date"] for r in parsed_rows}
             for d in dates_in_log:
@@ -433,7 +440,6 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                     "DELETE FROM state_transitions WHERE machine_id=? AND timestamp LIKE ?",
                     (machine_id, d + "%"),
                 )
-            conn.commit()
 
         # UPSERT hourly_utilization
         for (date_str, hour), bucket in hourly.items():
@@ -476,27 +482,38 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
 
         # Update machine_current_state with last row
         last_row = parsed_rows[-1]
-        # Determine "since" - find when current state started
-        since = last_row["iso_timestamp"]
-        for i in range(len(parsed_rows) - 1, -1, -1):
-            if parsed_rows[i]["state"] != last_row["state"]:
-                if i + 1 < len(parsed_rows):
-                    since = parsed_rows[i + 1]["iso_timestamp"]
-                break
+
+        # Determine "since" — when the current state was entered. The
+        # state_transitions table is the authoritative source: the most
+        # recent transition whose to_state == last_row.state is the answer.
+        # We must run this query AFTER the new transitions are INSERTed
+        # above, so any state change inside this batch is picked up.
+        #
+        # Why not derive from parsed_rows? Two failure modes that bit us:
+        #   1. Cross-month overwrite window (M05 2026-04-26): collector
+        #      copied stale month-N file content; parser ran, set since to
+        #      month-N's last transition; subsequent batches saw all-same-
+        #      state rows and reused the stale since via a sticky fallback.
+        #   2. Any quiet period where the batch has only one state and the
+        #      state happens to match prev_state: previously we copied DB's
+        #      existing since forward, anchoring it to whatever was set
+        #      first — even if state_transitions had a fresher entry.
+        # Pulling from state_transitions makes the answer deterministic
+        # regardless of batch boundaries or backfill ordering.
+        cursor = conn.execute(
+            "SELECT timestamp FROM state_transitions "
+            "WHERE machine_id=? AND to_state=? "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (machine_id, last_row["state"]),
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            since = row[0]
         else:
-            # All rows in batch have same state — check if state unchanged from DB
-            if prev_state == last_row["state"]:
-                cursor = conn.execute(
-                    "SELECT since FROM machine_current_state WHERE machine_id=?",
-                    (machine_id,),
-                )
-                existing_since = cursor.fetchone()
-                if existing_since and existing_since[0]:
-                    since = existing_since[0]
-                else:
-                    since = parsed_rows[0]["iso_timestamp"]
-            else:
-                since = parsed_rows[0]["iso_timestamp"]
+            # No transition has ever been recorded into this state for this
+            # machine. Fall back to the earliest row in this batch — the
+            # only locally available evidence of when the state started.
+            since = parsed_rows[0]["iso_timestamp"]
 
         conn.execute(
             "INSERT INTO machine_current_state "

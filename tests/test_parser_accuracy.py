@@ -541,6 +541,131 @@ class TestParserPeekAheadReplay(unittest.TestCase):
                              "Hour total cannot exceed 3600s, got {}".format(run_sec))
 
 
+class TestParserSinceFromTransitions(unittest.TestCase):
+    """Verify machine_current_state.since is derived from state_transitions,
+    not propagated from a prior DB value.
+
+    Scenario (M05 2026-04-26 cross-month stall observed in production):
+    1. Old monthly file content was parsed first, recording a transition at
+       2026-03-26T23:58:03 (RUN→STOP) and seeding since to that timestamp.
+    2. After the actual monthly rollover, a fresh batch lands containing
+       only RESET rows; prev_state from DB still says STOP from step 1.
+    3. The transitions table picks up the STOP→RESET entry inside this
+       batch, but the legacy since logic, hitting the all-same-state-in-
+       batch fallback, used to copy DB's existing since forward — anchoring
+       it to 3/26 indefinitely until a future batch happened to mix states.
+
+    The fix queries state_transitions for the most recent to_state==current
+    state row and uses its timestamp. This stays correct under every
+    backfill / cross-month / sticky-state pattern we have hit.
+    """
+
+    DATE = "2026/04/26"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "26Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, time_str, state, counter, date_str=None):
+        d = date_str or self.DATE
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=d, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _seed_stale_state(self):
+        """Mimic the post-bug state: machine_current_state.since pointing at
+        an old month, plus a state_transitions row from that period. This is
+        the snapshot the production DB had on 2026-04-27 for M05."""
+        with sqlite3.connect(self.db_path) as conn:
+            # Stale March transitions
+            conn.execute(
+                "INSERT INTO state_transitions "
+                "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+                "VALUES ('M05', '2026-03-26T23:58:03', 'RUN', 'STOP', 'O100.txt', '001', 0.088)"
+            )
+            # machine_current_state pointing at the old month with state=STOP.
+            conn.execute(
+                "INSERT INTO machine_current_state "
+                "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter) "
+                "VALUES ('M05', 'STOP', 'MAN', '', '000', 0.0, "
+                " '2026-03-26T23:58:03', '2026-03-26T23:58:03', 100000000)"
+            )
+            conn.commit()
+
+    def test_since_updates_via_transition_in_same_batch(self):
+        """First batch carrying the STOP→RESET transition must move since to
+        the transition timestamp, not leave it on the stale March value."""
+        self._seed_stale_state()
+
+        rows = [
+            # Final STOP row — triggers STOP→RESET on the next row
+            self._row("00:00:00", "STOP", 100000000),
+            self._row("00:00:01", "RESET", 100000001),
+            self._row("00:00:02", "RESET", 100000002),
+            self._row("00:00:03", "RESET", 100000003),
+        ]
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+        parse_log_file(self.db_path, "M05", self.log_path, "26")
+
+        with sqlite3.connect(self.db_path) as conn:
+            since, state = conn.execute(
+                "SELECT since, state FROM machine_current_state WHERE machine_id='M05'"
+            ).fetchone()
+        self.assertEqual(state, "RESET")
+        self.assertEqual(since, "2026-04-26T00:00:01",
+                         "since must point at the RESET-entry transition in this batch, "
+                         "not the stale March value")
+
+    def test_since_uses_latest_transition_when_batch_is_steady_state(self):
+        """A subsequent quiet batch (all RESET, prev_state matches) must
+        still anchor since to the latest transitions row, not the DB's
+        old since column."""
+        self._seed_stale_state()
+        # Pre-seed a fresh STOP→RESET transition that the parser must honor.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO state_transitions "
+                "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+                "VALUES ('M05', '2026-04-25T23:51:41', 'STOP', 'RESET', 'O100.txt', '000', 0.150)"
+            )
+            # Update DB state to RESET so prev_state will match the batch.
+            conn.execute(
+                "UPDATE machine_current_state SET state='RESET' WHERE machine_id='M05'"
+            )
+            conn.commit()
+
+        # Quiet batch — only RESET rows, all matching prev_state.
+        rows = [self._row("12:00:{:02d}".format(i), "RESET", 100000010 + i)
+                for i in range(5)]
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+        parse_log_file(self.db_path, "M05", self.log_path, "26")
+
+        with sqlite3.connect(self.db_path) as conn:
+            since = conn.execute(
+                "SELECT since FROM machine_current_state WHERE machine_id='M05'"
+            ).fetchone()[0]
+        self.assertEqual(since, "2026-04-25T23:51:41",
+                         "since must come from the most recent to_state=RESET "
+                         "row in state_transitions, not the stale 2026-03-26 "
+                         "value still in machine_current_state")
+
+
 class TestParserCrossMidnightReplay(unittest.TestCase):
     """Test that peek-ahead replay in a file with cross-midnight rows does
     NOT wipe prior-day data.
