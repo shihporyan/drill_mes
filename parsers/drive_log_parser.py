@@ -210,9 +210,12 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
         if overwritten:
             last_line = 0
 
-        # Read all lines from file
+        # Read all lines from file. Use errors='replace' so a single bad byte
+        # (occasional SMB transfer corruption or firmware glitch) doesn't make
+        # the entire file unparseable for the rest of the day. Affected line
+        # falls through parse_csv_line and gets skipped.
         try:
-            with open(log_path, "r", encoding="utf-8") as f:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
         except Exception as e:
             logger.error("[%s] Failed to read %s: %s", machine_id, log_path, e)
@@ -422,6 +425,10 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
         # was detected, clear old data for this file's primary date. Cross-
         # midnight rows were already filtered out above, so parsed_rows only
         # contains dates this file owns.
+        # No commit here — DELETE + UPSERT must land in a single transaction
+        # so dashboard reads never see the brief window where the day's data
+        # has been wiped but not yet rebuilt. (Replay can fire on 5 machines
+        # per cycle in production, every 10 min, so the window is hit often.)
         if overwritten:
             dates_in_log = {r["date"] for r in parsed_rows}
             for d in dates_in_log:
@@ -433,7 +440,6 @@ def parse_log_file(db_path, machine_id, log_path, day_prefix):
                     "DELETE FROM state_transitions WHERE machine_id=? AND timestamp LIKE ?",
                     (machine_id, d + "%"),
                 )
-            conn.commit()
 
         # UPSERT hourly_utilization
         for (date_str, hour), bucket in hourly.items():
