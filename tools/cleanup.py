@@ -1,8 +1,12 @@
 """
 Backup cleanup: delete local log backups older than retention period.
 
-Scans backup_root for date-stamped subdirectories and removes those
-exceeding backup_retention_days from settings.
+Scans backup_root for date-stamped subdirectories (YYYYMMDD format only)
+and removes those exceeding backup_retention_days from settings. Other
+directories like Kataoka's persistent `programs/` and `lsr_files/` are
+skipped — their dir mtime reflects creation time, not the freshness of
+files inside, and deleting them would force unnecessary re-fetches from
+the SMB share each cycle and can transiently break work-order parsing.
 
 Usage:
     python tools/cleanup.py           # Dry run (show what would be deleted)
@@ -11,6 +15,7 @@ Usage:
 
 import logging
 import os
+import re
 import shutil
 import stat
 import sys
@@ -22,6 +27,9 @@ sys.path.insert(0, PROJECT_ROOT)
 from parsers.base_parser import load_settings
 
 logger = logging.getLogger(__name__)
+
+# Only treat 8-digit dirs (YYYYMMDD) as candidates for age-based deletion.
+DATE_DIR_RE = re.compile(r"^\d{8}$")
 
 
 def _force_writable_then_retry(func, path, exc_info):
@@ -69,6 +77,10 @@ def cleanup_old_backups(dry_run=True, settings=None):
         for date_dir in os.listdir(machine_path):
             date_path = os.path.join(machine_path, date_dir)
             if not os.path.isdir(date_path):
+                continue
+            if not DATE_DIR_RE.match(date_dir):
+                # Not a YYYYMMDD dated dir — skip. Covers programs/, lsr_files/,
+                # and any other non-dated operational dirs.
                 continue
 
             try:

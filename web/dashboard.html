@@ -348,7 +348,6 @@ function RankingTab({overviewData}) {
   const [trendAll, setTrendAll] = useState(null);
   const [trendDrill, setTrendDrill] = useState(null);
   const [trendLaser, setTrendLaser] = useState(null);
-  const [utilMonth, setUtilMonth] = useState(null);
   const [drillLevel, setDrillLevel] = useState("year");
   const [selectedMonth, setSelectedMonth] = useState(null);
   const [selectedWeek, setSelectedWeek] = useState(null);
@@ -384,7 +383,6 @@ function RankingTab({overviewData}) {
         }
       })
       .catch(() => fetchTrends("year", {year: String(currentYear)}));
-    fetchUtilization("month", currentMonthStr).then(setUtilMonth);
   },[]);
 
   const drillToMonth = (monthNum) => {
@@ -419,13 +417,15 @@ function RankingTab({overviewData}) {
   const laserCount = sLaser.machine_count || 0;
   const allCount = sAll.machine_count || 0;
 
-  // Compute type-specific averages from per-machine monthly utilization (for compare cards)
+  // 機鑽/雷鑽 KPI numbers track the *currently displayed* period (year/month/week)
+  // by reading the period-aware trend summaries instead of always pulling the
+  // current month's per-machine table — that's what users expected when they
+  // saw 35% / 40% sit static while drilling into different time windows.
   const ovMachines = overviewData && overviewData.machines ? overviewData.machines : [];
-  const monthMachines = utilMonth && utilMonth.machines ? utilMonth.machines : [];
-  const drillMonth = monthMachines.filter(m => getMachineType(m.id, ovMachines) === "takeuchi");
-  const laserMonth = monthMachines.filter(m => getMachineType(m.id, ovMachines) === "kataoka");
-  const drillAvgMonth = drillMonth.length ? Math.round(drillMonth.reduce((s,m)=>s+m.utilization,0)/drillMonth.length) : 0;
-  const laserAvgMonth = laserMonth.length ? Math.round(laserMonth.reduce((s,m)=>s+m.utilization,0)/laserMonth.length) : 0;
+  const drillAvgPeriod = Math.round(avgUtilDrill);
+  const laserAvgPeriod = Math.round(avgUtilLaser);
+  const drillHasMachines = drillCount > 0;
+  const laserHasMachines = laserCount > 0;
 
   // KPI filter
   const kpiAvg = kpiFilter === "drill" ? Math.round(avgUtilDrill) : kpiFilter === "laser" ? Math.round(avgUtilLaser) : Math.round(avgUtilAll);
@@ -480,22 +480,22 @@ function RankingTab({overviewData}) {
             <span style={{fontSize:16,fontWeight:700,color:COLOR_TEXT_PRIMARY}}>%</span>
           </div>
         </div>
-        {drillMonth.length > 0 && (<>
+        {drillHasMachines && (<>
           <div style={{width:1,height:36,background:"#e5e7eb"}}/>
           <div style={{display:"flex",flexDirection:"column"}}>
-            <span style={{fontSize:11,color:"#6b7280"}}>機鑽 ({drillMonth.length} 台)</span>
+            <span style={{fontSize:11,color:"#6b7280"}}>機鑽 ({drillCount} 台)</span>
             <div style={{display:"flex",alignItems:"baseline",gap:3}}>
-              <span style={{fontSize:28,fontWeight:800,color:COLOR_DRILL,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{drillAvgMonth}</span>
+              <span style={{fontSize:28,fontWeight:800,color:COLOR_DRILL,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{drillAvgPeriod}</span>
               <span style={{fontSize:14,fontWeight:700,color:COLOR_DRILL}}>%</span>
             </div>
           </div>
         </>)}
-        {laserMonth.length > 0 && (<>
+        {laserHasMachines && (<>
           <div style={{width:1,height:36,background:"#e5e7eb"}}/>
           <div style={{display:"flex",flexDirection:"column"}}>
-            <span style={{fontSize:11,color:"#6b7280"}}>雷鑽 ({laserMonth.length} 台)</span>
+            <span style={{fontSize:11,color:"#6b7280"}}>雷鑽 ({laserCount} 台)</span>
             <div style={{display:"flex",alignItems:"baseline",gap:3}}>
-              <span style={{fontSize:28,fontWeight:800,color:COLOR_LASER,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{laserAvgMonth}</span>
+              <span style={{fontSize:28,fontWeight:800,color:COLOR_LASER,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{laserAvgPeriod}</span>
               <span style={{fontSize:14,fontWeight:700,color:COLOR_LASER}}>%</span>
             </div>
           </div>
@@ -561,20 +561,22 @@ function RankingTab({overviewData}) {
 // ============ TAB 3: ANALYSIS ============
 function AnalysisTab({overviewData}) {
   const [heatData, setHeatData] = useState(null);
-  const [utilMonth, setUtilMonth] = useState(null);
+  const [utilRank, setUtilRank] = useState(null);
   const [hoveredCell, setHoveredCell] = useState(null);
   const [filter, setFilter] = useState("all");
   const [range, setRange] = useState("day");
+  const [rankPeriod, setRankPeriod] = useState("month");
   const today = new Date().toISOString().slice(0,10);
-  const monthStr = today.slice(0,7);
   const shiftW = 48;
 
   useEffect(()=>{
     fetchHeatmap(today, range).then(setHeatData);
   },[range]);
   useEffect(()=>{
-    fetchUtilization("month", monthStr).then(setUtilMonth);
-  },[]);
+    // Ranking row supports day/week/month. month uses YYYY-MM; the others use the full ISO date.
+    const dateArg = rankPeriod === "month" ? today.slice(0,7) : today;
+    fetchUtilization(rankPeriod, dateArg).then(setUtilRank);
+  },[rankPeriod]);
 
   if (!heatData || !heatData.machines) return <div style={{padding:40,textAlign:"center",color:"#9ca3af"}}>載入中...</div>;
 
@@ -632,9 +634,16 @@ function AnalysisTab({overviewData}) {
   const oNight = avgOf(m => m.shifts.night);
   const shiftSpread = Math.max(oDay,oMid,oNight) - Math.min(oDay,oMid,oNight);
 
-  // Machine ranking by month
-  const monthSorted = utilMonth && utilMonth.machines ? [...utilMonth.machines].sort((a,b)=>b.utilization-a.utilization) : [];
-  const bottomThreshold = Math.max(monthSorted.length - 3, 0);
+  // Machine ranking — period (day/week/month) is user-selectable so 排班 / 月度
+  // / 日對比 can all use this same row.
+  const rankSorted = utilRank && utilRank.machines ? [...utilRank.machines].sort((a,b)=>b.utilization-a.utilization) : [];
+  const bottomThreshold = Math.max(rankSorted.length - 3, 0);
+  const rankPeriodOpts = [
+    {key:"day",   label:"本日"},
+    {key:"week",  label:"本週"},
+    {key:"month", label:"本月"},
+  ];
+  const rankPeriodLabel = rankPeriodOpts.find(o => o.key === rankPeriod).label;
 
   const shiftCellStyle = (v) => {
     const ok = v >= TARGET;
@@ -694,14 +703,27 @@ function AnalysisTab({overviewData}) {
 
   return (
     <div>
-      {monthSorted.length > 0 && (
+      {rankSorted.length > 0 && (
         <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"18px 24px",marginBottom:16}}>
-          <div style={{fontSize:13,fontWeight:600,color:"#374151",marginBottom:12}}>各機台稼動率排行（本月）</div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,gap:12,flexWrap:"wrap"}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>各機台稼動率排行（{rankPeriodLabel}）</div>
+            <div style={{display:"inline-flex",border:"1px solid #e5e7eb",borderRadius:6,overflow:"hidden"}}>
+              {rankPeriodOpts.map((r,i)=>(
+                <button key={r.key} onClick={()=>setRankPeriod(r.key)} style={{
+                  padding:"5px 14px",fontSize:11,fontWeight:600,
+                  border:0, borderRight: i<rankPeriodOpts.length-1 ? "1px solid #e5e7eb" : "0",
+                  background:rankPeriod===r.key?"#111827":"#fff",
+                  color:rankPeriod===r.key?"#fff":"#6b7280",cursor:"pointer",
+                }}>{r.label}</button>
+              ))}
+            </div>
+          </div>
           <div style={{display:"flex",flexDirection:"column",gap:5}}>
-            {monthSorted.map((m,i)=>{
+            {rankSorted.map((m,i)=>{
               const v = m.utilization;
               const c = v>=TARGET?"#059669":v>=50?"#d97706":"#dc2626";
               const typeColor = machineTypeColor(m.id, ovMachines);
+              const noHoleData = m.has_hole_data === false;
               return (
                 <div key={m.id} style={{display:"flex",alignItems:"center",gap:8,height:26}}>
                   <span style={{width:20,height:20,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,flexShrink:0,
@@ -715,7 +737,11 @@ function AnalysisTab({overviewData}) {
                     <div style={{position:"absolute",left:`${TARGET}%`,top:0,bottom:0,width:1.5,background:"#3b82f6",opacity:0.5}}/>
                   </div>
                   {v<=18&&<span style={{fontSize:10,fontWeight:700,color:c,width:28}}>{v}%</span>}
-                  <span title={fmt(m.hole_count)+" 孔"} style={{fontSize:10,color:"#6b7280",width:54,textAlign:"right",flexShrink:0,fontVariantNumeric:"tabular-nums"}}>{fmtCompact(m.hole_count)} 孔</span>
+                  {noHoleData ? (
+                    <span title="此機台未提供孔數資料（INFO 共享未建立）" style={{fontSize:9,color:"#9ca3af",width:54,textAlign:"right",flexShrink:0,fontStyle:"italic"}}>無孔數</span>
+                  ) : (
+                    <span title={fmt(m.hole_count)+" 孔"} style={{fontSize:10,color:"#6b7280",width:54,textAlign:"right",flexShrink:0,fontVariantNumeric:"tabular-nums"}}>{fmtCompact(m.hole_count)} 孔</span>
+                  )}
                 </div>
               );
             })}

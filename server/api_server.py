@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 # as 2h-3h because of 4-32s STOP transients).
 SINCE_FLICKER_SECONDS = 60
 
+# Earliest date with trustworthy production data. Anything before is residual
+# from pre-cutover dev runs (sparse rows on 2026-03-25..27 from initial laser
+# testing) and creates visual noise in trend / month views. All trend, heatmap,
+# and utilization queries filter on date >= this value. If the production
+# baseline shifts (e.g. another fresh cutover), update this constant.
+DATA_START_DATE = "2026-04-01"
+
 
 def compute_effective_since(conn, machine_id, state, db_since):
     """Return the start of the current uninterrupted state run, ignoring
@@ -408,15 +415,19 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
 
         with self._get_db() as conn:
             if period == "day":
-                cursor = conn.execute(
-                    "SELECT machine_id, "
-                    "SUM(run_seconds) as run_seconds, "
-                    "SUM(total_seconds) as total_seconds, "
-                    "SUM(hole_count) as hole_count "
-                    "FROM hourly_utilization WHERE date=? "
-                    "GROUP BY machine_id ORDER BY machine_id",
-                    (date_str,),
-                )
+                if date_str < DATA_START_DATE:
+                    rows = []
+                    cursor = None
+                else:
+                    cursor = conn.execute(
+                        "SELECT machine_id, "
+                        "SUM(run_seconds) as run_seconds, "
+                        "SUM(total_seconds) as total_seconds, "
+                        "SUM(hole_count) as hole_count "
+                        "FROM hourly_utilization WHERE date=? "
+                        "GROUP BY machine_id ORDER BY machine_id",
+                        (date_str,),
+                    )
             elif period == "week":
                 # Calculate week range (Mon-Sun)
                 try:
@@ -426,6 +437,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     return
                 week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
                 week_end = week_start + datetime.timedelta(days=6)
+                # Clamp lower bound to DATA_START_DATE.
+                effective_start = max(week_start.isoformat(), DATA_START_DATE)
                 cursor = conn.execute(
                     "SELECT machine_id, "
                     "SUM(run_seconds) as run_seconds, "
@@ -434,7 +447,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     "FROM hourly_utilization "
                     "WHERE date BETWEEN ? AND ? "
                     "GROUP BY machine_id ORDER BY machine_id",
-                    (week_start.isoformat(), week_end.isoformat()),
+                    (effective_start, week_end.isoformat()),
                 )
             elif period == "month":
                 # date format: YYYY-MM
@@ -445,15 +458,25 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     "SUM(total_seconds) as total_seconds, "
                     "SUM(hole_count) as hole_count "
                     "FROM hourly_utilization "
-                    "WHERE date LIKE ? "
+                    "WHERE date LIKE ? AND date >= ? "
                     "GROUP BY machine_id ORDER BY machine_id",
-                    (month_prefix + "%",),
+                    (month_prefix + "%", DATA_START_DATE),
                 )
             else:
                 self._send_error(400, "Invalid period: {}".format(period))
                 return
 
-            rows = cursor.fetchall()
+            rows = cursor.fetchall() if cursor is not None else []
+
+        # Map machine_id -> skip_info flag so the dashboard can grey out the
+        # hole_count column for machines that are knowingly without per-hole
+        # data (e.g. L1 has no INFO share — hole events exist in raw logs but
+        # without ProcTime{Start,End} we can't attribute them to work orders).
+        machines_config = self.server.machines_config
+        skip_info_ids = {
+            m["id"] for m in machines_config.get("machines", [])
+            if m.get("skip_info")
+        }
 
         machines = []
         total_run = 0
@@ -468,6 +491,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                 "run_seconds": run,
                 "total_seconds": total,
                 "hole_count": r["hole_count"] or 0,
+                "has_hole_data": r["machine_id"] not in skip_info_ids,
             })
             total_run += run
             total_secs += total
@@ -531,9 +555,9 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                         "SELECT substr(date,6,2) as month, "
                         "SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
-                        "FROM hourly_utilization WHERE date LIKE ?" + type_filter_sql +
+                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + type_filter_sql +
                         " GROUP BY substr(date,6,2) ORDER BY month",
-                        (year + "%",) + type_filter_params,
+                        (year + "%", DATA_START_DATE) + type_filter_params,
                     )
                     rows = cursor.fetchall()
                 month_names = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"]
@@ -566,8 +590,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     machine_count = len(filtered_machine_ids)
                 else:
                     machine_count = conn.execute(
-                        "SELECT COUNT(DISTINCT machine_id) as cnt FROM hourly_utilization WHERE date LIKE ?",
-                        (year + "%",),
+                        "SELECT COUNT(DISTINCT machine_id) as cnt FROM hourly_utilization WHERE date LIKE ? AND date >= ?",
+                        (year + "%", DATA_START_DATE),
                     ).fetchone()["cnt"]
 
                 self._send_json({
@@ -593,36 +617,57 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     cursor = conn.execute(
                         "SELECT date, SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
-                        "FROM hourly_utilization WHERE date LIKE ?" + type_filter_sql +
+                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + type_filter_sql +
                         " GROUP BY date ORDER BY date",
-                        (month_prefix + "%",) + type_filter_params,
+                        (month_prefix + "%", DATA_START_DATE) + type_filter_params,
                     )
                     rows = cursor.fetchall()
 
-                # Group by ISO week
-                week_data = {}
+                # Build the calendar weeks for this month: W1 starts on the
+                # Monday of the week containing day 1; successive Mondays are
+                # W2, W3... up to (and including) the Monday whose week still
+                # touches this month. Empty weeks are returned with util=null
+                # so the label sequence stays aligned with the calendar — the
+                # chart renders gaps for weeks without data instead of relabeling
+                # the surviving weeks W1, W2 (the cause of the "今天 4/28 卻
+                # 顯示 W2" bug).
+                first_day = datetime.date(int(year), int(month), 1)
+                if int(month) == 12:
+                    last_day = datetime.date(int(year) + 1, 1, 1) - datetime.timedelta(days=1)
+                else:
+                    last_day = datetime.date(int(year), int(month) + 1, 1) - datetime.timedelta(days=1)
+                w1_start = first_day - datetime.timedelta(days=first_day.weekday())
+
+                weeks = []  # list of (week_num, week_start)
+                cursor_ws = w1_start
+                wn = 1
+                while cursor_ws <= last_day:
+                    weeks.append((wn, cursor_ws))
+                    cursor_ws += datetime.timedelta(days=7)
+                    wn += 1
+
+                week_data = {ws.isoformat(): {"run": 0, "total": 0, "holes": 0}
+                             for _, ws in weeks}
                 for r in rows:
                     d = datetime.date.fromisoformat(r["date"])
-                    # Week number within the month (1-based)
-                    week_start = d - datetime.timedelta(days=d.weekday())
-                    week_key = week_start.isoformat()
-                    if week_key not in week_data:
-                        week_data[week_key] = {"run": 0, "total": 0, "holes": 0, "start": week_start}
-                    week_data[week_key]["run"] += (r["run"] or 0)
-                    week_data[week_key]["total"] += (r["total"] or 0)
-                    week_data[week_key]["holes"] += (r["holes"] or 0)
+                    ws_iso = (d - datetime.timedelta(days=d.weekday())).isoformat()
+                    if ws_iso in week_data:
+                        week_data[ws_iso]["run"] += (r["run"] or 0)
+                        week_data[ws_iso]["total"] += (r["total"] or 0)
+                        week_data[ws_iso]["holes"] += (r["holes"] or 0)
 
                 now = datetime.date.today()
                 current_week_start = now - datetime.timedelta(days=now.weekday())
 
                 data = []
-                for i, (wk, wd) in enumerate(sorted(week_data.items())):
-                    util = round(wd["run"] / wd["total"] * 100, 1) if wd["total"] > 0 else 0
+                for wn, ws in weeks:
+                    wd = week_data[ws.isoformat()]
+                    util = round(wd["run"] / wd["total"] * 100, 1) if wd["total"] > 0 else None
                     data.append({
-                        "label": "W{}".format(i + 1), "week": i + 1,
-                        "week_start": wd["start"].isoformat(),
-                        "util": util, "holes": wd["holes"],
-                        "isCurrent": wd["start"] == current_week_start,
+                        "label": "W{}".format(wn), "week": wn,
+                        "week_start": ws.isoformat(),
+                        "util": util, "holes": wd["holes"] if wd["total"] > 0 else None,
+                        "isCurrent": ws == current_week_start,
                     })
 
                 with_data = [d for d in data if d["util"] is not None]
@@ -660,12 +705,13 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                 if filtered_machine_ids == []:
                     rows = []
                 else:
+                    effective_week_start = max(week_start.isoformat(), DATA_START_DATE)
                     cursor = conn.execute(
                         "SELECT date, SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
                         "FROM hourly_utilization WHERE date BETWEEN ? AND ?" + type_filter_sql +
                         " GROUP BY date ORDER BY date",
-                        (week_start.isoformat(), week_end.isoformat()) + type_filter_params,
+                        (effective_week_start, week_end.isoformat()) + type_filter_params,
                     )
                     rows = cursor.fetchall()
                 date_map = {r["date"]: r for r in rows}
@@ -775,12 +821,13 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                 return hour
 
         with self._get_db() as conn:
+            effective_start = max(start.isoformat(), DATA_START_DATE)
             cursor = conn.execute(
                 "SELECT machine_id, date, hour, run_seconds, total_seconds, hole_count "
                 "FROM hourly_utilization "
                 "WHERE date BETWEEN ? AND ? "
                 "ORDER BY machine_id, date, hour",
-                (start.isoformat(), end.isoformat()),
+                (effective_start, end.isoformat()),
             )
             rows = cursor.fetchall()
 
