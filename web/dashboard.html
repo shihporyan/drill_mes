@@ -72,13 +72,51 @@ function genMockOverview() {
   const offline = machines.filter(m=>m.state==="OFFLINE").length;
   return { timestamp: new Date().toISOString().slice(0,19), machines, summary: { running, idle, stopped, offline, total: machines.length }, health: machines.map(m=>({id:m.id,is_online:m.state!=="OFFLINE",last_seen:null})) };
 }
-function genMockHeatmap() {
+function genMockHeatmap(range) {
+  range = range || "day";
   const ids = ["M01","M02","M03","M04","M05","M06","M07","M08","M09","M10","M11","M12","M13","L1","L2","L3","L4"];
+  const today = new Date();
+  const dayLabels = ["一","二","三","四","五","六","日"];
+  let bucketCount, bucketLabels, startDate, endDate;
+  if (range === "week") {
+    bucketCount = 7;
+    bucketLabels = dayLabels;
+    const ws = new Date(today); ws.setDate(today.getDate() - ((today.getDay()+6)%7));
+    startDate = ws.toISOString().slice(0,10);
+    const we = new Date(ws); we.setDate(ws.getDate()+6);
+    endDate = we.toISOString().slice(0,10);
+  } else if (range === "month") {
+    const y = today.getFullYear(), m = today.getMonth();
+    const last = new Date(y, m+1, 0).getDate();
+    bucketCount = last;
+    bucketLabels = Array.from({length:last},(_,i)=>String(i+1));
+    startDate = `${y}-${String(m+1).padStart(2,"0")}-01`;
+    endDate = `${y}-${String(m+1).padStart(2,"0")}-${String(last).padStart(2,"0")}`;
+  } else {
+    bucketCount = 24;
+    bucketLabels = Array.from({length:24},(_,h)=>String(h).padStart(2,"0"));
+    startDate = endDate = today.toISOString().slice(0,10);
+  }
   const machines = ids.map(id => {
     const isLaser = id.startsWith("L");
-    return { id, hours: Array.from({length:24},(_,h)=>({ hour:h, utilization: h>=8&&h<20 ? (isLaser?25+Math.floor(Math.random()*50):40+Math.floor(Math.random()*50)) : (isLaser?Math.floor(Math.random()*20):Math.floor(Math.random()*30)), hole_count: Math.floor(Math.random()*800) })) };
+    const cells = Array.from({length:bucketCount},(_,i)=>{
+      const baseUtil = range==="day"
+        ? (i>=8 && i<20 ? (isLaser?25+Math.floor(Math.random()*50):40+Math.floor(Math.random()*50)) : (isLaser?Math.floor(Math.random()*20):Math.floor(Math.random()*30)))
+        : (isLaser ? 30+Math.floor(Math.random()*40) : 50+Math.floor(Math.random()*40));
+      return { idx: i, utilization: baseUtil, hole_count: Math.floor(Math.random()* (range==="day"?800:50000)) };
+    });
+    const shifts = {
+      day:   isLaser?40+Math.floor(Math.random()*30):55+Math.floor(Math.random()*30),
+      mid:   isLaser?35+Math.floor(Math.random()*30):50+Math.floor(Math.random()*30),
+      night: isLaser?15+Math.floor(Math.random()*20):30+Math.floor(Math.random()*30),
+    };
+    const m = { id, cells, shifts };
+    if (range === "day") {
+      m.hours = cells.map(c => ({ hour: c.idx, utilization: c.utilization, hole_count: c.hole_count }));
+    }
+    return m;
   });
-  return { date: new Date().toISOString().slice(0,10), machines };
+  return { range, date: today.toISOString().slice(0,10), start_date: startDate, end_date: endDate, bucket_labels: bucketLabels, machines };
 }
 function genMockUtilization(period) {
   const ids = ["M13","M14","L2","L3"];
@@ -89,8 +127,9 @@ function genMockUtilization(period) {
 async function fetchOverview() {
   try { return await apiFetch("/api/drilling/overview"); } catch(e) { console.warn("API unavailable, using mock:", e.message); return genMockOverview(); }
 }
-async function fetchHeatmap(date) {
-  try { return await apiFetch("/api/drilling/heatmap?date=" + date); } catch(e) { return genMockHeatmap(); }
+async function fetchHeatmap(date, range) {
+  range = range || "day";
+  try { return await apiFetch("/api/drilling/heatmap?range=" + range + "&date=" + date); } catch(e) { return genMockHeatmap(range); }
 }
 async function fetchUtilization(period, date) {
   try { return await apiFetch("/api/drilling/utilization?period=" + period + "&date=" + date); } catch(e) { return genMockUtilization(period); }
@@ -112,7 +151,24 @@ const SC = {
   OFFLINE:{label:"離線",  bg:"#dc2626"},
 };
 const fmt = n => n ? n.toLocaleString() : "—";
+// Compact K/M/B format for hole counts (e.g. 1234 -> "1.2K", 1500000 -> "1.5M")
+const fmtCompact = n => {
+  if (!n && n !== 0) return "—";
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs < 1000) return String(n);
+  if (abs < 1_000_000) return (n/1000).toFixed(abs < 10_000 ? 1 : 0) + "K";
+  if (abs < 1_000_000_000) return (n/1_000_000).toFixed(abs < 10_000_000 ? 1 : 0) + "M";
+  return (n/1_000_000_000).toFixed(1) + "B";
+};
 const durStr = m => m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m} min`;
+// Shift assignment by hour-start (Option A): day [8-14], mid [15-22], night [0-7, 23]
+const SHIFTS = {
+  day:   {label: "日班", hours: [8,9,10,11,12,13,14],          color: "#059669", bg: "#d1fae5"},
+  mid:   {label: "中班", hours: [15,16,17,18,19,20,21,22],     color: "#d97706", bg: "#fed7aa"},
+  night: {label: "夜班", hours: [0,1,2,3,4,5,6,7,23],          color: "#6366f1", bg: "#e0e7ff"},
+};
+const getShift = h => h>=8&&h<=14 ? "day" : h>=15&&h<=22 ? "mid" : "night";
 const getMachineType = (id, overviewMachines) => {
   if (overviewMachines) { const m = overviewMachines.find(x => x.id === id); if (m) return m.type; }
   return id.startsWith("L") ? "kataoka" : "takeuchi";
@@ -239,22 +295,28 @@ function OverviewTab({data}) {
 // ============ RANKING BAR CHART ============
 function RankingBarChart({data, drillLevel, onBarClick, accentColor, chartH}) {
   const maxVal = 100;
+  // Reserve top space inside bar area so 100% bars don't overlap pct label/dot.
+  const reservedTop = 32;
+  const effectiveH = chartH - reservedTop;
+  const paddingTop = 20;
+  // y position helper for util value v (0-100)
+  const yFor = v => paddingTop + chartH - effectiveH * v / maxVal;
   return (
-    <div style={{position:"relative",height:chartH+60,paddingTop:20}}>
+    <div style={{position:"relative",height:chartH+60,paddingTop:paddingTop}}>
       {/* Target line */}
-      <div style={{position:"absolute",left:0,right:0,top:20+(chartH*(1-TARGET/maxVal)),display:"flex",alignItems:"center"}}>
+      <div style={{position:"absolute",left:0,right:0,top:yFor(TARGET),display:"flex",alignItems:"center"}}>
         <div style={{flex:1,borderTop:`2px dashed ${COLOR_TARGET}`}}/>
         <span style={{fontSize:11,color:COLOR_TARGET,fontWeight:600,marginLeft:6,padding:"2px 6px",background:"#eff6ff",borderRadius:4,whiteSpace:"nowrap"}}>目標 {TARGET}%</span>
       </div>
       {/* Y-axis labels */}
       {[0,25,50,75,100].map(v=>(
-        <div key={v} style={{position:"absolute",left:0,top:20+(chartH*(1-v/maxVal))-6,fontSize:10,color:"#d1d5db"}}>{v}%</div>
+        <div key={v} style={{position:"absolute",left:0,top:yFor(v)-6,fontSize:10,color:"#d1d5db"}}>{v}%</div>
       ))}
       {/* Bars */}
       <div style={{display:"flex",alignItems:"flex-end",height:chartH,paddingLeft:32,gap:drillLevel==="year"?4:12}}>
         {data.map((d,i)=>{
           const hasData = d.util !== null;
-          const h = hasData ? Math.max(2, chartH * d.util / maxVal) : 2;
+          const h = hasData ? Math.max(2, effectiveH * d.util / maxVal) : 2;
           const barColor = hasData ? accentColor : COLOR_NO_DATA;
           const barOpacity = !hasData ? 1 : (d.util >= TARGET ? 1 : 0.45);
           const canClick = hasData && onBarClick && ((drillLevel==="year") || (drillLevel==="month"));
@@ -268,7 +330,7 @@ function RankingBarChart({data, drillLevel, onBarClick, accentColor, chartH}) {
               <div style={{width:"100%",maxWidth:drillLevel==="year"?40:56,height:h,background:barColor,borderRadius:"4px 4px 0 0",transition:"height 0.4s",
                 opacity:barOpacity,minHeight:2}}/>
               <div style={{fontSize:11,fontWeight:d.isCurrent?700:500,color:d.isCurrent?COLOR_TARGET:COLOR_TEXT_SECONDARY,marginTop:6}}>{d.label}</div>
-              {hasData && <div style={{fontSize:10,color:COLOR_TEXT_MUTED,marginTop:1}}>{fmt(d.holes)} 孔</div>}
+              {hasData && <div title={fmt(d.holes)+" 孔"} style={{fontSize:10,color:COLOR_TEXT_MUTED,marginTop:1}}>{fmtCompact(d.holes)} 孔</div>}
               {!hasData && <div style={{fontSize:10,color:"#d1d5db",marginTop:1}}>—</div>}
             </div>
           );
@@ -305,7 +367,23 @@ function RankingTab({overviewData}) {
   };
 
   useEffect(()=>{
-    fetchTrends("year", {year: String(currentYear)});
+    // Default landing: jump straight to current week of current month
+    // (saves 2 manual drill clicks; user can use breadcrumb to back out).
+    const month = now.getMonth() + 1;
+    const monthStr = String(month);
+    fetchUtilizationTrend("month", {year: String(currentYear), month: monthStr})
+      .then(monthData => {
+        const cur = (monthData && monthData.data || []).find(d => d.isCurrent);
+        if (cur && cur.week_start) {
+          setSelectedMonth(month);
+          setSelectedWeek(cur.week);
+          setDrillLevel("week");
+          fetchTrends("week", {year: String(currentYear), month: monthStr, week: String(cur.week), week_start: cur.week_start});
+        } else {
+          fetchTrends("year", {year: String(currentYear)});
+        }
+      })
+      .catch(() => fetchTrends("year", {year: String(currentYear)}));
     fetchUtilization("month", currentMonthStr).then(setUtilMonth);
   },[]);
 
@@ -383,46 +461,48 @@ function RankingTab({overviewData}) {
 
   return (
     <div>
-      <div style={{display:"flex",gap:12,marginBottom:20,alignItems:"stretch"}}>
-        <div style={{flex:2,background:"#fff",borderRadius:12,padding:"18px 24px",border:"1px solid #e5e7eb"}}>
-          <div style={{display:"flex",gap:4,marginBottom:10}}>
-            {[{key:"all",label:"全部"},{key:"drill",label:"機鑽"},{key:"laser",label:"雷鑽"}].map(f=>(
-              <button key={f.key} onClick={()=>setKpiFilter(f.key)} style={{
-                padding:"4px 14px",borderRadius:5,border:"1.5px solid",fontSize:12,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
-                background:kpiFilter===f.key?"#111827":"#fff",
-                color:kpiFilter===f.key?"#fff":"#6b7280",
-                borderColor:kpiFilter===f.key?"#111827":"#e5e7eb",
-              }}>{f.label}</button>
-            ))}
-          </div>
-          <div style={{fontSize:11,color:"#6b7280",marginBottom:4}}>{periodLabel}</div>
-          <div style={{display:"flex",alignItems:"baseline",gap:6}}>
-            <span style={{fontSize:56,fontWeight:800,color:COLOR_TEXT_PRIMARY,lineHeight:1,fontVariantNumeric:"tabular-nums",letterSpacing:"-2px"}}>{kpiAvg}</span>
-            <span style={{fontSize:24,fontWeight:700,color:COLOR_TEXT_PRIMARY}}>%</span>
-          </div>
-          <div style={{fontSize:12,color:kpiAvg>=TARGET?COLOR_DRILL:"#d97706",marginTop:4,fontWeight:600}}>
-            {kpiAvg>=TARGET?"✓ 達標":"✗ 未達標"}
-            <span style={{color:COLOR_TEXT_MUTED,fontWeight:400,marginLeft:8}}>目標 {TARGET}%</span>
+      <div style={{background:"#fff",borderRadius:12,padding:"12px 18px",border:"1px solid #e5e7eb",marginBottom:14,display:"flex",alignItems:"center",gap:18,flexWrap:"wrap"}}>
+        <div style={{display:"flex",gap:4}}>
+          {[{key:"all",label:"全部"},{key:"drill",label:"機鑽"},{key:"laser",label:"雷鑽"}].map(f=>(
+            <button key={f.key} onClick={()=>setKpiFilter(f.key)} style={{
+              padding:"4px 12px",borderRadius:5,border:"1.5px solid",fontSize:12,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
+              background:kpiFilter===f.key?"#111827":"#fff",
+              color:kpiFilter===f.key?"#fff":"#6b7280",
+              borderColor:kpiFilter===f.key?"#111827":"#e5e7eb",
+            }}>{f.label}</button>
+          ))}
+        </div>
+        <div style={{width:1,height:36,background:"#e5e7eb"}}/>
+        <div style={{display:"flex",flexDirection:"column"}}>
+          <span style={{fontSize:11,color:"#6b7280"}}>{periodLabel}</span>
+          <div style={{display:"flex",alignItems:"baseline",gap:3}}>
+            <span style={{fontSize:34,fontWeight:800,color:COLOR_TEXT_PRIMARY,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{kpiAvg}</span>
+            <span style={{fontSize:16,fontWeight:700,color:COLOR_TEXT_PRIMARY}}>%</span>
           </div>
         </div>
-        {drillMonth.length > 0 && (
-          <div style={{flex:1,background:"#f0fdf4",borderRadius:12,padding:"18px 20px",border:"1px solid #bbf7d0",display:"flex",flexDirection:"column",justifyContent:"center"}}>
-            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
-              <div style={{width:10,height:10,borderRadius:2,background:COLOR_DRILL}}/>
-              <span style={{fontSize:12,color:"#6b7280"}}>機鑽平均 ({drillMonth.length} 台)</span>
+        {drillMonth.length > 0 && (<>
+          <div style={{width:1,height:36,background:"#e5e7eb"}}/>
+          <div style={{display:"flex",flexDirection:"column"}}>
+            <span style={{fontSize:11,color:"#6b7280"}}>機鑽 ({drillMonth.length} 台)</span>
+            <div style={{display:"flex",alignItems:"baseline",gap:3}}>
+              <span style={{fontSize:28,fontWeight:800,color:COLOR_DRILL,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{drillAvgMonth}</span>
+              <span style={{fontSize:14,fontWeight:700,color:COLOR_DRILL}}>%</span>
             </div>
-            <div style={{fontSize:36,fontWeight:800,color:COLOR_DRILL,lineHeight:1}}>{drillAvgMonth}%</div>
           </div>
-        )}
-        {laserMonth.length > 0 && (
-          <div style={{flex:1,background:"#eef2ff",borderRadius:12,padding:"18px 20px",border:"1px solid #c7d2fe",display:"flex",flexDirection:"column",justifyContent:"center"}}>
-            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
-              <div style={{width:10,height:10,borderRadius:2,background:COLOR_LASER}}/>
-              <span style={{fontSize:12,color:"#6b7280"}}>雷鑽平均 ({laserMonth.length} 台)</span>
+        </>)}
+        {laserMonth.length > 0 && (<>
+          <div style={{width:1,height:36,background:"#e5e7eb"}}/>
+          <div style={{display:"flex",flexDirection:"column"}}>
+            <span style={{fontSize:11,color:"#6b7280"}}>雷鑽 ({laserMonth.length} 台)</span>
+            <div style={{display:"flex",alignItems:"baseline",gap:3}}>
+              <span style={{fontSize:28,fontWeight:800,color:COLOR_LASER,lineHeight:1.1,letterSpacing:"-1px",fontVariantNumeric:"tabular-nums"}}>{laserAvgMonth}</span>
+              <span style={{fontSize:14,fontWeight:700,color:COLOR_LASER}}>%</span>
             </div>
-            <div style={{fontSize:36,fontWeight:800,color:COLOR_LASER,lineHeight:1}}>{laserAvgMonth}%</div>
           </div>
-        )}
+        </>)}
+        <div style={{marginLeft:"auto",fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,background:kpiAvg>=TARGET?"#f0fdf4":"#fef3c7",color:kpiAvg>=TARGET?COLOR_DRILL:"#d97706"}}>
+          {kpiAvg>=TARGET?"✓ 達標":"✗ 未達標"} <span style={{color:COLOR_TEXT_MUTED,fontWeight:500,marginLeft:4}}>目標 {TARGET}%</span>
+        </div>
       </div>
 
       <div style={{background:"#fff",borderRadius:12,border:"1px solid #e5e7eb",padding:"24px 28px"}}>
@@ -484,13 +564,15 @@ function AnalysisTab({overviewData}) {
   const [utilMonth, setUtilMonth] = useState(null);
   const [hoveredCell, setHoveredCell] = useState(null);
   const [filter, setFilter] = useState("all");
+  const [range, setRange] = useState("day");
   const today = new Date().toISOString().slice(0,10);
   const monthStr = today.slice(0,7);
-  const dayStart=8, dayEnd=20;
-  const shiftW = 52;
+  const shiftW = 48;
 
   useEffect(()=>{
-    fetchHeatmap(today).then(setHeatData);
+    fetchHeatmap(today, range).then(setHeatData);
+  },[range]);
+  useEffect(()=>{
     fetchUtilization("month", monthStr).then(setUtilMonth);
   },[]);
 
@@ -513,33 +595,57 @@ function AnalysisTab({overviewData}) {
     if(v>=75) return "#166534"; if(v>=50) return "#713f12"; if(v>=25) return "#991b1b"; return "#9ca3af";
   };
 
-  const cellW=32, cellH=26, labelW=78;
+  const bucketLabels = heatData.bucket_labels || [];
+  const bucketCount = bucketLabels.length || 24;
+  const cellW = range === "day" ? 32 : range === "week" ? 76 : 28;
+  const cellH = 26;
+  const labelW = 78;
+  // shift "fresh start" hours: blue boundary appears at the hour each shift takes over (day mode only)
+  const shiftBoundaries = range === "day" ? [8, 15, 23] : [];
+  const tooltipPrimary = (idx) => {
+    if (range === "day") return `${String(idx).padStart(2,"0")}:00`;
+    if (range === "week") return ["一","二","三","四","五","六","日"][idx] || "";
+    return `${idx+1} 日`;
+  };
+  const tooltipShift = (idx) => range === "day" ? SHIFTS[getShift(idx)].label : "";
 
-  // Build full 24h array for each machine
-  const machinesWithHours = heatData.machines.map(m => {
-    const hourMap = {};
-    (m.hours||[]).forEach(h => { hourMap[h.hour] = h; });
-    const full24 = Array.from({length:24},(_,h)=>({
-      hour: h,
-      utilization: hourMap[h] ? hourMap[h].utilization : 0,
-      hole_count: hourMap[h] ? hourMap[h].hole_count : 0,
+  // Normalize machine cells: prefer new `cells`; fall back to legacy `hours` (day mode only).
+  const machinesWithCells = heatData.machines.map(m => {
+    const cellMap = {};
+    const src = m.cells || (m.hours||[]).map(h => ({idx: h.hour, utilization: h.utilization, hole_count: h.hole_count}));
+    src.forEach(c => { cellMap[c.idx] = c; });
+    const fullCells = Array.from({length:bucketCount},(_,i)=>({
+      idx: i,
+      utilization: cellMap[i] ? cellMap[i].utilization : 0,
+      hole_count: cellMap[i] ? cellMap[i].hole_count : 0,
     }));
-    const dayHrs = full24.filter(t=>t.hour>=dayStart&&t.hour<dayEnd);
-    const nightHrs = full24.filter(t=>t.hour<dayStart||t.hour>=dayEnd);
-    const dayAvg = dayHrs.length ? Math.round(dayHrs.reduce((s,t)=>s+t.utilization,0)/dayHrs.length) : 0;
-    const nightAvg = nightHrs.length ? Math.round(nightHrs.reduce((s,t)=>s+t.utilization,0)/nightHrs.length) : 0;
-    return { ...m, full24, dayAvg, nightAvg };
+    const shifts = m.shifts || {day:0, mid:0, night:0};
+    return { ...m, fullCells, shifts };
   });
 
-  const drillHeat = machinesWithHours.filter(m => getMachineType(m.id, ovMachines) === "takeuchi");
-  const laserHeat = machinesWithHours.filter(m => getMachineType(m.id, ovMachines) === "kataoka");
+  const drillHeat = machinesWithCells.filter(m => getMachineType(m.id, ovMachines) === "takeuchi");
+  const laserHeat = machinesWithCells.filter(m => getMachineType(m.id, ovMachines) === "kataoka");
 
-  const oDay = machinesWithHours.length ? Math.round(machinesWithHours.reduce((s,m)=>s+m.dayAvg,0)/machinesWithHours.length) : 0;
-  const oNight = machinesWithHours.length ? Math.round(machinesWithHours.reduce((s,m)=>s+m.nightAvg,0)/machinesWithHours.length) : 0;
+  const avgOf = sel => machinesWithCells.length ? Math.round(machinesWithCells.reduce((s,m)=>s+sel(m),0)/machinesWithCells.length) : 0;
+  const oDay   = avgOf(m => m.shifts.day);
+  const oMid   = avgOf(m => m.shifts.mid);
+  const oNight = avgOf(m => m.shifts.night);
+  const shiftSpread = Math.max(oDay,oMid,oNight) - Math.min(oDay,oMid,oNight);
 
   // Machine ranking by month
   const monthSorted = utilMonth && utilMonth.machines ? [...utilMonth.machines].sort((a,b)=>b.utilization-a.utilization) : [];
   const bottomThreshold = Math.max(monthSorted.length - 3, 0);
+
+  const shiftCellStyle = (v) => {
+    const ok = v >= TARGET;
+    const warn = v >= 40;
+    return {
+      width:shiftW, textAlign:"center", fontSize:10, fontWeight:700,
+      color: ok ? "#059669" : warn ? "#d97706" : "#dc2626",
+      background: ok ? "#f0fdf4" : warn ? "#fffbeb" : "#fef2f2",
+      borderRadius:3, padding:"3px 0", flexShrink:0,
+    };
+  };
 
   // Render a single heatmap row
   const renderHeatRow = (m, mi) => {
@@ -550,15 +656,15 @@ function AnalysisTab({overviewData}) {
           <div style={{width:3,height:12,borderRadius:1,background:typeColor,flexShrink:0}}/>
           <span style={{fontSize:10,fontWeight:600,color:"#374151"}}>{m.id}</span>
         </div>
-        {m.full24.map((t,hi)=>{
+        {m.fullCells.map((t,hi)=>{
           const v = t.utilization;
           const isH = hoveredCell && hoveredCell.mi===mi && hoveredCell.hi===hi;
           const bg = utilColor(v,filter);
           const tc = textColor(v,filter);
-          const isShiftB = t.hour===dayStart||t.hour===dayEnd;
+          const isShiftB = shiftBoundaries.includes(t.idx);
           const isActive = filter==="all"||(filter==="low25"&&v<25)||(filter==="low50"&&v<50)||(filter==="high75"&&v>=75);
           return (
-            <div key={hi} onMouseEnter={()=>setHoveredCell({mi,hi,id:m.id,hour:t.hour,util:v,holes:t.hole_count})} onMouseLeave={()=>setHoveredCell(null)}
+            <div key={hi} onMouseEnter={()=>setHoveredCell({mi,hi,id:m.id,idx:t.idx,util:v,holes:t.hole_count})} onMouseLeave={()=>setHoveredCell(null)}
               style={{width:cellW,height:cellH,background:bg,borderLeft:isShiftB?"2px solid #3b82f6":"1px solid rgba(255,255,255,0.8)",borderTop:"1px solid rgba(255,255,255,0.8)",
                 display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:isActive?700:400,color:tc,cursor:"default",
                 transform:isH?"scale(1.15)":"scale(1)",transition:"all 0.1s",zIndex:isH?5:1,position:"relative",borderRadius:isH?3:0,
@@ -568,11 +674,23 @@ function AnalysisTab({overviewData}) {
             </div>
           );
         })}
-        <div style={{width:shiftW,marginLeft:8,textAlign:"center",fontSize:10,fontWeight:700,color:m.dayAvg>=TARGET?"#059669":"#d97706",background:m.dayAvg>=TARGET?"#f0fdf4":"#fffbeb",borderRadius:3,padding:"3px 0"}}>{m.dayAvg}%</div>
-        <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:700,color:m.nightAvg>=TARGET?"#059669":m.nightAvg>=40?"#d97706":"#dc2626",background:m.nightAvg>=TARGET?"#f0fdf4":m.nightAvg>=40?"#fffbeb":"#fef2f2",borderRadius:3,padding:"3px 0"}}>{m.nightAvg}%</div>
+        <div style={{...shiftCellStyle(m.shifts.day), marginLeft:8}}>{Math.round(m.shifts.day)}%</div>
+        <div style={shiftCellStyle(m.shifts.mid)}>{Math.round(m.shifts.mid)}%</div>
+        <div style={shiftCellStyle(m.shifts.night)}>{Math.round(m.shifts.night)}%</div>
       </div>
     );
   };
+
+  const rangeOpts = [
+    {key:"day",   label:"本日"},
+    {key:"week",  label:"本週"},
+    {key:"month", label:"本月"},
+  ];
+  const rangeTitle = range === "day"
+    ? `24 小時稼動熱力圖（${heatData.date || today}）`
+    : range === "week"
+    ? `本週稼動熱力圖（${heatData.start_date || ""} ~ ${heatData.end_date || ""}）`
+    : `本月稼動熱力圖（${(heatData.date||today).slice(0,7)}）`;
 
   return (
     <div>
@@ -597,7 +715,7 @@ function AnalysisTab({overviewData}) {
                     <div style={{position:"absolute",left:`${TARGET}%`,top:0,bottom:0,width:1.5,background:"#3b82f6",opacity:0.5}}/>
                   </div>
                   {v<=18&&<span style={{fontSize:10,fontWeight:700,color:c,width:28}}>{v}%</span>}
-                  <span style={{fontSize:10,color:"#6b7280",width:64,textAlign:"right",flexShrink:0}}>{fmt(m.hole_count)} 孔</span>
+                  <span title={fmt(m.hole_count)+" 孔"} style={{fontSize:10,color:"#6b7280",width:54,textAlign:"right",flexShrink:0,fontVariantNumeric:"tabular-nums"}}>{fmtCompact(m.hole_count)} 孔</span>
                 </div>
               );
             })}
@@ -613,46 +731,65 @@ function AnalysisTab({overviewData}) {
 
       <div style={{display:"flex",gap:12,marginBottom:16}}>
         {[
-          {label:"日班平均（08–20）",val:`${oDay}%`,color:oDay>=TARGET?"#059669":"#d97706",bg:"#f0fdf4",border:"#bbf7d0"},
-          {label:"夜班平均（20–08）",val:`${oNight}%`,color:oNight>=TARGET?"#059669":"#dc2626",bg:oNight>=TARGET?"#f0fdf4":"#fef2f2",border:oNight>=TARGET?"#bbf7d0":"#fecaca"},
-          {label:"日夜落差",val:`${Math.abs(oDay-oNight)}%`,color:"#dc2626",bg:"#fef2f2",border:"#fecaca"},
+          {label:"日班 07:30–16:30",val:`${oDay}%`,  color:oDay>=TARGET?"#059669":"#d97706",       bg:"#f0fdf4", border:"#bbf7d0"},
+          {label:"中班 15:00–24:00",val:`${oMid}%`,  color:oMid>=TARGET?"#059669":"#d97706",       bg:"#fff7ed", border:"#fed7aa"},
+          {label:"夜班 23:30–08:00",val:`${oNight}%`,color:oNight>=TARGET?"#059669":oNight>=40?"#d97706":"#dc2626", bg:"#eef2ff", border:"#c7d2fe"},
+          {label:"班次落差",val:`${shiftSpread}%`,color:shiftSpread>=20?"#dc2626":"#d97706", bg:"#fef2f2", border:"#fecaca"},
         ].map((c,i)=>(
-          <div key={i} style={{flex:1,background:c.bg,borderRadius:10,padding:"12px 18px",border:`1px solid ${c.border}`}}>
+          <div key={i} style={{flex:1,background:c.bg,borderRadius:10,padding:"10px 14px",border:`1px solid ${c.border}`}}>
             <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>{c.label}</div>
-            <div style={{fontSize:28,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</div>
+            <div style={{fontSize:24,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</div>
           </div>
         ))}
       </div>
 
       <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"16px 20px"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-          <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>24 小時稼動熱力圖（{today}）</div>
-          <div style={{display:"flex",gap:4}}>
-            {filterOpts.map(f=>(
-              <button key={f.key} onClick={()=>setFilter(f.key)} style={{
-                padding:"5px 12px",borderRadius:6,border:"1.5px solid",fontSize:11,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
-                background:filter===f.key?(f.key==="low25"?"#dc2626":f.key==="low50"?"#d97706":f.key==="high75"?"#059669":"#111827"):"#fff",
-                color:filter===f.key?"#fff":"#6b7280",borderColor:filter===f.key?"transparent":"#e5e7eb",
-              }}>{f.label}</button>
-            ))}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,gap:12,flexWrap:"wrap"}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>{rangeTitle}</div>
+          <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <div style={{display:"inline-flex",border:"1px solid #e5e7eb",borderRadius:6,overflow:"hidden"}}>
+              {rangeOpts.map((r,i)=>(
+                <button key={r.key} onClick={()=>setRange(r.key)} style={{
+                  padding:"5px 14px",fontSize:11,fontWeight:600,
+                  border:0, borderRight: i<rangeOpts.length-1 ? "1px solid #e5e7eb" : "0",
+                  background:range===r.key?"#111827":"#fff",
+                  color:range===r.key?"#fff":"#6b7280",cursor:"pointer",
+                }}>{r.label}</button>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:4}}>
+              {filterOpts.map(f=>(
+                <button key={f.key} onClick={()=>setFilter(f.key)} style={{
+                  padding:"5px 12px",borderRadius:6,border:"1.5px solid",fontSize:11,fontWeight:600,cursor:"pointer",transition:"all 0.15s",
+                  background:filter===f.key?(f.key==="low25"?"#dc2626":f.key==="low50"?"#d97706":f.key==="high75"?"#059669":"#111827"):"#fff",
+                  color:filter===f.key?"#fff":"#6b7280",borderColor:filter===f.key?"transparent":"#e5e7eb",
+                }}>{f.label}</button>
+              ))}
+            </div>
           </div>
         </div>
         <div style={{overflowX:"auto"}}>
-          <div style={{minWidth:labelW+cellW*24+shiftW*2+16}}>
+          <div style={{minWidth:labelW+cellW*bucketCount+shiftW*3+24}}>
             <div style={{display:"flex",alignItems:"flex-end",marginBottom:2,paddingLeft:labelW}}>
-              {Array.from({length:24},(_,h)=>(
-                <div key={h} style={{width:cellW,textAlign:"center",fontSize:10,fontWeight:h===dayStart||h===dayEnd?700:400,color:h===dayStart||h===dayEnd?"#3b82f6":"#9ca3af"}}>
-                  {h.toString().padStart(2,"0")}
-                </div>
-              ))}
-              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:"#059669",marginLeft:8}}>日班</div>
-              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:"#6366f1"}}>夜班</div>
+              {bucketLabels.map((lbl,i)=>{
+                const isShiftB = range==="day" && shiftBoundaries.includes(i);
+                return (
+                  <div key={i} style={{width:cellW,textAlign:"center",fontSize:10,fontWeight:isShiftB?700:400,color:isShiftB?"#3b82f6":"#9ca3af"}}>
+                    {lbl}
+                  </div>
+                );
+              })}
+              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:SHIFTS.day.color,marginLeft:8}}>日班</div>
+              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:SHIFTS.mid.color}}>中班</div>
+              <div style={{width:shiftW,textAlign:"center",fontSize:10,fontWeight:600,color:SHIFTS.night.color}}>夜班</div>
             </div>
-            <div style={{display:"flex",marginBottom:4,paddingLeft:labelW}}>
-              {Array.from({length:24},(_,h)=>(
-                <div key={h} style={{width:cellW,height:3,background:(h>=dayStart&&h<dayEnd)?"#d1fae5":"#e0e7ff"}}/>
-              ))}
-            </div>
+            {range==="day" && (
+              <div style={{display:"flex",marginBottom:4,paddingLeft:labelW}}>
+                {Array.from({length:bucketCount},(_,h)=>(
+                  <div key={h} style={{width:cellW,height:3,background:SHIFTS[getShift(h)].bg}}/>
+                ))}
+              </div>
+            )}
             {drillHeat.map((m,mi)=> renderHeatRow(m, mi))}
             {laserHeat.length > 0 && (
               <div style={{display:"flex",alignItems:"center",margin:"6px 0",paddingLeft:labelW}}>
@@ -665,10 +802,10 @@ function AnalysisTab({overviewData}) {
             {hoveredCell&&(
               <div style={{position:"fixed",top:8,right:28,zIndex:100,background:"#111827",color:"#fff",padding:"8px 14px",borderRadius:8,fontSize:12,fontWeight:500,boxShadow:"0 4px 12px rgba(0,0,0,0.15)",display:"flex",gap:12}}>
                 <span style={{fontWeight:700}}>{hoveredCell.id}</span>
-                <span>{String(hoveredCell.hour).padStart(2,"0")}:00</span>
+                <span>{tooltipPrimary(hoveredCell.idx)}</span>
                 <span style={{fontWeight:700,color:hoveredCell.util>=TARGET?"#4ade80":hoveredCell.util>=50?"#fbbf24":"#f87171"}}>{Math.round(hoveredCell.util)}%</span>
-                <span style={{color:"#9ca3af"}}>{fmt(hoveredCell.holes)} 孔</span>
-                <span style={{color:"#9ca3af"}}>{hoveredCell.hour>=8&&hoveredCell.hour<20?"日班":"夜班"}</span>
+                <span title={fmt(hoveredCell.holes)+" 孔"} style={{color:"#9ca3af"}}>{fmtCompact(hoveredCell.holes)} 孔</span>
+                {tooltipShift(hoveredCell.idx) && <span style={{color:"#9ca3af"}}>{tooltipShift(hoveredCell.idx)}</span>}
               </div>
             )}
           </div>
@@ -694,10 +831,14 @@ function AnalysisTab({overviewData}) {
               </div>
             </>
           )}
-          <span>｜</span>
-          <div style={{display:"flex",alignItems:"center",gap:3}}>
-            <div style={{width:2,height:8,background:"#3b82f6"}}/><span>班次分界</span>
-          </div>
+          {range==="day" && (
+            <>
+              <span>｜</span>
+              <div style={{display:"flex",alignItems:"center",gap:3}}>
+                <div style={{width:2,height:8,background:"#3b82f6"}}/><span>班次起點</span>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -712,38 +712,137 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
     def _handle_heatmap(self, params):
         """Handle GET /api/drilling/heatmap.
 
-        Returns hourly utilization for all machines on a given date.
+        Returns utilization heatmap aggregated at three granularities:
+        - range=day  (default): 24 cells per machine (1 hour each)
+        - range=week:           7 cells per machine (1 day each, Mon..Sun)
+        - range=month:          N cells per machine (1 day each, day-of-month)
+
+        For all ranges also returns per-machine shift averages computed
+        from hour-level data using hour-start ownership rule:
+            day   = hours [8..14]
+            mid   = hours [15..22]
+            night = hours [0..7, 23]
 
         Args:
-            params: Query parameters (date).
+            params: Query parameters (range, date).
+                date format: YYYY-MM-DD (day/week) or YYYY-MM[-DD] (month).
         """
+        range_ = params.get("range", "day")
         date_str = params.get("date", datetime.date.today().isoformat())
+
+        # Resolve [start, end] date range and bucket assignment for this granularity.
+        if range_ == "week":
+            try:
+                ref = datetime.date.fromisoformat(date_str)
+            except ValueError:
+                self._send_error(400, "Invalid date format")
+                return
+            start = ref - datetime.timedelta(days=ref.weekday())
+            end = start + datetime.timedelta(days=6)
+            bucket_count = 7
+            bucket_labels = ["一", "二", "三", "四", "五", "六", "日"]
+            def bucket_idx(date_iso, hour):
+                d = datetime.date.fromisoformat(date_iso)
+                return d.weekday()  # 0=Mon..6=Sun
+        elif range_ == "month":
+            ym = date_str[:7]
+            try:
+                year = int(ym[:4])
+                month = int(ym[5:7])
+            except (ValueError, IndexError):
+                self._send_error(400, "Invalid date format")
+                return
+            start = datetime.date(year, month, 1)
+            if month == 12:
+                end = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+            else:
+                end = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+            bucket_count = end.day
+            bucket_labels = [str(d) for d in range(1, bucket_count + 1)]
+            def bucket_idx(date_iso, hour):
+                return int(date_iso.split("-")[2]) - 1
+        else:  # day
+            try:
+                ref = datetime.date.fromisoformat(date_str)
+            except ValueError:
+                self._send_error(400, "Invalid date format")
+                return
+            start = ref
+            end = ref
+            bucket_count = 24
+            bucket_labels = ["{:02d}".format(h) for h in range(24)]
+            def bucket_idx(date_iso, hour):
+                return hour
 
         with self._get_db() as conn:
             cursor = conn.execute(
-                "SELECT machine_id, hour, utilization, hole_count "
-                "FROM hourly_utilization WHERE date=? "
-                "ORDER BY machine_id, hour",
-                (date_str,),
+                "SELECT machine_id, date, hour, run_seconds, total_seconds, hole_count "
+                "FROM hourly_utilization "
+                "WHERE date BETWEEN ? AND ? "
+                "ORDER BY machine_id, date, hour",
+                (start.isoformat(), end.isoformat()),
             )
             rows = cursor.fetchall()
 
-        # Group by machine
-        machine_data = {}
+        cells_acc = {}   # mid -> [{run, total, holes}, ...] of bucket_count
+        shifts_acc = {}  # mid -> {day|mid|night: {run, total}}
+
+        def shift_of(h):
+            if 8 <= h <= 14:
+                return "day"
+            if 15 <= h <= 22:
+                return "mid"
+            return "night"
+
         for r in rows:
             mid = r["machine_id"]
-            if mid not in machine_data:
-                machine_data[mid] = []
-            machine_data[mid].append({
-                "hour": r["hour"],
-                "utilization": r["utilization"],
-                "hole_count": r["hole_count"],
-            })
+            if mid not in cells_acc:
+                cells_acc[mid] = [{"run": 0, "total": 0, "holes": 0} for _ in range(bucket_count)]
+                shifts_acc[mid] = {
+                    "day":   {"run": 0, "total": 0},
+                    "mid":   {"run": 0, "total": 0},
+                    "night": {"run": 0, "total": 0},
+                }
+            run = r["run_seconds"] or 0
+            total = r["total_seconds"] or 0
+            holes = r["hole_count"] or 0
+            idx = bucket_idx(r["date"], r["hour"])
+            if 0 <= idx < bucket_count:
+                cells_acc[mid][idx]["run"] += run
+                cells_acc[mid][idx]["total"] += total
+                cells_acc[mid][idx]["holes"] += holes
+            sh = shift_of(r["hour"])
+            shifts_acc[mid][sh]["run"] += run
+            shifts_acc[mid][sh]["total"] += total
 
-        machines = [{"id": mid, "hours": hours} for mid, hours in sorted(machine_data.items())]
+        machines = []
+        for mid in sorted(cells_acc.keys()):
+            cells = []
+            for i, c in enumerate(cells_acc[mid]):
+                util = round(c["run"] / c["total"] * 100, 1) if c["total"] > 0 else 0
+                cells.append({"idx": i, "utilization": util, "hole_count": c["holes"]})
+            shifts = {}
+            for sh in ("day", "mid", "night"):
+                s = shifts_acc[mid][sh]
+                shifts[sh] = round(s["run"] / s["total"] * 100, 1) if s["total"] > 0 else 0
+            machines.append({"id": mid, "cells": cells, "shifts": shifts})
+
+        # Backward-compat: in day mode also expose machines[].hours with the
+        # legacy {hour, utilization, hole_count} shape so older clients/tests
+        # don't break. New code should consume `cells`.
+        if range_ == "day":
+            for m in machines:
+                m["hours"] = [
+                    {"hour": c["idx"], "utilization": c["utilization"], "hole_count": c["hole_count"]}
+                    for c in m["cells"]
+                ]
 
         self._send_json({
+            "range": range_,
             "date": date_str,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "bucket_labels": bucket_labels,
             "machines": machines,
         })
 

@@ -64,3 +64,5 @@ npm run test:e2e:ui
 - [notes/m13_firmware_gap_investigation.md](notes/m13_firmware_gap_investigation.md) — M13 Drive.Log 時間跳躍/倒退現象
 - [notes/tx1_flush_latency_investigation.md](notes/tx1_flush_latency_investigation.md) — TX1.Log flush 延遲調查計畫 + 4/20 兩次測試結果（state 轉態驅動 flush 已驗證）
 - [notes/tx1_transition_triggered_parse_plan.md](notes/tx1_transition_triggered_parse_plan.md) — Layer 2 優化規劃：state 轉態觸發 TX1 parse，預期工單切換偵測壓到 <5 min
+- [notes/kataoka_notebooklm_queries.md](notes/kataoka_notebooklm_queries.md) — 給 NotebookLM 的 3 個 prompt（ProcTimeStart 行為 / station 起訖時間 / 孔數 & 板別）
+- [notes/data_anomaly_apr01_holes.md](notes/data_anomaly_apr01_holes.md) — 2026-04-01/02 孔數爆量異常（百萬級），疑似 4/23 修復前 backfill 重複，待清理
