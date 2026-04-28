@@ -127,12 +127,14 @@ function genMockUtilization(period) {
 async function fetchOverview() {
   try { return await apiFetch("/api/drilling/overview"); } catch(e) { console.warn("API unavailable, using mock:", e.message); return genMockOverview(); }
 }
-async function fetchHeatmap(date, range) {
+async function fetchHeatmap(date, range, includeWeekends) {
   range = range || "day";
-  try { return await apiFetch("/api/drilling/heatmap?range=" + range + "&date=" + date); } catch(e) { return genMockHeatmap(range); }
+  const w = includeWeekends ? "1" : "0";
+  try { return await apiFetch("/api/drilling/heatmap?range=" + range + "&date=" + date + "&include_weekends=" + w); } catch(e) { return genMockHeatmap(range); }
 }
-async function fetchUtilization(period, date) {
-  try { return await apiFetch("/api/drilling/utilization?period=" + period + "&date=" + date); } catch(e) { return genMockUtilization(period); }
+async function fetchUtilization(period, date, includeWeekends) {
+  const w = includeWeekends ? "1" : "0";
+  try { return await apiFetch("/api/drilling/utilization?period=" + period + "&date=" + date + "&include_weekends=" + w); } catch(e) { return genMockUtilization(period); }
 }
 async function fetchTransitions(machine, date) {
   try { return await apiFetch("/api/drilling/transitions?machine=" + machine + "&date=" + date); } catch(e) { return { machine_id: machine, date, transitions: [] }; }
@@ -353,13 +355,18 @@ function RankingTab({overviewData}) {
   const [selectedWeek, setSelectedWeek] = useState(null);
   const [loading, setLoading] = useState(true);
   const [kpiFilter, setKpiFilter] = useState("all");
+  const [includeWeekends, setIncludeWeekends] = useState(false);
 
-  const fetchTrends = (level, params) => {
+  const fetchTrends = (level, params, includeWE) => {
+    // Use the explicit includeWE if passed (for the toggle handler that needs
+    // to fire with the new value before state has updated), else read from state.
+    const we = includeWE === undefined ? includeWeekends : includeWE;
     setLoading(true);
+    const baseParams = {...params, include_weekends: we ? "1" : "0"};
     Promise.all([
-      fetchUtilizationTrend(level, params),
-      fetchUtilizationTrend(level, {...params, type:"takeuchi"}),
-      fetchUtilizationTrend(level, {...params, type:"kataoka"}),
+      fetchUtilizationTrend(level, baseParams),
+      fetchUtilizationTrend(level, {...baseParams, type:"takeuchi"}),
+      fetchUtilizationTrend(level, {...baseParams, type:"kataoka"}),
     ]).then(([all, drill, laser]) => {
       setTrendAll(all); setTrendDrill(drill); setTrendLaser(laser); setLoading(false);
     });
@@ -370,7 +377,7 @@ function RankingTab({overviewData}) {
     // (saves 2 manual drill clicks; user can use breadcrumb to back out).
     const month = now.getMonth() + 1;
     const monthStr = String(month);
-    fetchUtilizationTrend("month", {year: String(currentYear), month: monthStr})
+    fetchUtilizationTrend("month", {year: String(currentYear), month: monthStr, include_weekends: includeWeekends ? "1" : "0"})
       .then(monthData => {
         const cur = (monthData && monthData.data || []).find(d => d.isCurrent);
         if (cur && cur.week_start) {
@@ -384,6 +391,25 @@ function RankingTab({overviewData}) {
       })
       .catch(() => fetchTrends("year", {year: String(currentYear)}));
   },[]);
+
+  // Re-fetch the active level whenever the weekend toggle flips so all 3
+  // trends (all/drill/laser) and KPI numbers refresh together.
+  const reloadCurrentLevel = (we) => {
+    if (drillLevel === "year") {
+      fetchTrends("year", {year: String(currentYear)}, we);
+    } else if (drillLevel === "month") {
+      fetchTrends("month", {year: String(currentYear), month: String(selectedMonth)}, we);
+    } else if (drillLevel === "week" && selectedWeek) {
+      // We don't have week_start in state directly; compute it from currentYear+month+week.
+      // Fallback: backend accepts month+week without week_start (it'll calculate).
+      fetchTrends("week", {year: String(currentYear), month: String(selectedMonth), week: String(selectedWeek)}, we);
+    }
+  };
+  const toggleWeekends = () => {
+    const next = !includeWeekends;
+    setIncludeWeekends(next);
+    reloadCurrentLevel(next);
+  };
 
   const drillToMonth = (monthNum) => {
     setSelectedMonth(monthNum);
@@ -500,7 +526,17 @@ function RankingTab({overviewData}) {
             </div>
           </div>
         </>)}
-        <div style={{marginLeft:"auto",fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,background:kpiAvg>=TARGET?"#f0fdf4":"#fef3c7",color:kpiAvg>=TARGET?COLOR_DRILL:"#d97706"}}>
+        <button onClick={toggleWeekends} title="切換是否把 Sat / Sun 計入稼動率（預設不計，反映正常工作日表現）" style={{
+          marginLeft:"auto",
+          fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,
+          border:"1.5px solid",cursor:"pointer",
+          background: includeWeekends?"#fef3c7":"#fff",
+          color:      includeWeekends?"#92400e":"#6b7280",
+          borderColor:includeWeekends?"#fcd34d":"#e5e7eb",
+        }}>
+          {includeWeekends ? "✓ 含週末" : "排除週末"}
+        </button>
+        <div style={{fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,background:kpiAvg>=TARGET?"#f0fdf4":"#fef3c7",color:kpiAvg>=TARGET?COLOR_DRILL:"#d97706"}}>
           {kpiAvg>=TARGET?"✓ 達標":"✗ 未達標"} <span style={{color:COLOR_TEXT_MUTED,fontWeight:500,marginLeft:4}}>目標 {TARGET}%</span>
         </div>
       </div>
@@ -566,17 +602,18 @@ function AnalysisTab({overviewData}) {
   const [filter, setFilter] = useState("all");
   const [range, setRange] = useState("day");
   const [rankPeriod, setRankPeriod] = useState("month");
+  const [includeWeekends, setIncludeWeekends] = useState(false);
   const today = new Date().toISOString().slice(0,10);
   const shiftW = 48;
 
   useEffect(()=>{
-    fetchHeatmap(today, range).then(setHeatData);
-  },[range]);
+    fetchHeatmap(today, range, includeWeekends).then(setHeatData);
+  },[range, includeWeekends]);
   useEffect(()=>{
     // Ranking row supports day/week/month. month uses YYYY-MM; the others use the full ISO date.
     const dateArg = rankPeriod === "month" ? today.slice(0,7) : today;
-    fetchUtilization(rankPeriod, dateArg).then(setUtilRank);
-  },[rankPeriod]);
+    fetchUtilization(rankPeriod, dateArg, includeWeekends).then(setUtilRank);
+  },[rankPeriod, includeWeekends]);
 
   if (!heatData || !heatData.machines) return <div style={{padding:40,textAlign:"center",color:"#9ca3af"}}>載入中...</div>;
 
@@ -707,15 +744,24 @@ function AnalysisTab({overviewData}) {
         <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"18px 24px",marginBottom:16}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,gap:12,flexWrap:"wrap"}}>
             <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>各機台稼動率排行（{rankPeriodLabel}）</div>
-            <div style={{display:"inline-flex",border:"1px solid #e5e7eb",borderRadius:6,overflow:"hidden"}}>
-              {rankPeriodOpts.map((r,i)=>(
-                <button key={r.key} onClick={()=>setRankPeriod(r.key)} style={{
-                  padding:"5px 14px",fontSize:11,fontWeight:600,
-                  border:0, borderRight: i<rankPeriodOpts.length-1 ? "1px solid #e5e7eb" : "0",
-                  background:rankPeriod===r.key?"#111827":"#fff",
-                  color:rankPeriod===r.key?"#fff":"#6b7280",cursor:"pointer",
-                }}>{r.label}</button>
-              ))}
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <button onClick={()=>setIncludeWeekends(!includeWeekends)} title="切換是否把 Sat / Sun 計入。預設不計（反映平日表現）；開啟後可看出週末加班情形" style={{
+                fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,
+                border:"1.5px solid",cursor:"pointer",
+                background: includeWeekends?"#fef3c7":"#fff",
+                color:      includeWeekends?"#92400e":"#6b7280",
+                borderColor:includeWeekends?"#fcd34d":"#e5e7eb",
+              }}>{includeWeekends ? "✓ 含週末" : "排除週末"}</button>
+              <div style={{display:"inline-flex",border:"1px solid #e5e7eb",borderRadius:6,overflow:"hidden"}}>
+                {rankPeriodOpts.map((r,i)=>(
+                  <button key={r.key} onClick={()=>setRankPeriod(r.key)} style={{
+                    padding:"5px 14px",fontSize:11,fontWeight:600,
+                    border:0, borderRight: i<rankPeriodOpts.length-1 ? "1px solid #e5e7eb" : "0",
+                    background:rankPeriod===r.key?"#111827":"#fff",
+                    color:rankPeriod===r.key?"#fff":"#6b7280",cursor:"pointer",
+                  }}>{r.label}</button>
+                ))}
+              </div>
             </div>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:5}}>

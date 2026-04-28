@@ -66,3 +66,4 @@ npm run test:e2e:ui
 - [notes/tx1_transition_triggered_parse_plan.md](notes/tx1_transition_triggered_parse_plan.md) — Layer 2 優化規劃：state 轉態觸發 TX1 parse，預期工單切換偵測壓到 <5 min
 - [notes/kataoka_notebooklm_queries.md](notes/kataoka_notebooklm_queries.md) — 給 NotebookLM 的 3 個 prompt（ProcTimeStart 行為 / station 起訖時間 / 孔數 & 板別）
 - [notes/data_anomaly_apr01_holes.md](notes/data_anomaly_apr01_holes.md) — 2026-04-01/02 孔數爆量異常（百萬級），疑似 4/23 修復前 backfill 重複，待清理
+- [notes/dashboard_audit_20260428.md](notes/dashboard_audit_20260428.md) — 4/28 USB 快照資料稽核：修了什麼 / 未修觀察 / 已確認正確的資料

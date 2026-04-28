@@ -605,6 +605,28 @@ def count_holes_in_range(events_by_station, station, start_dt, end_dt):
     return hi - lo
 
 
+def holes_by_hour_in_range(events_by_station, station, start_dt, end_dt):
+    """Bucket beam events on a station within [start_dt, end_dt] by (date, hour).
+
+    Returns:
+        dict mapping (YYYY-MM-DD, hour) -> count of events.
+
+    A WO whose drilling spans multiple hours can then credit each hour
+    its actual share of holes — vs the old "dump-everything-into-end-hour"
+    rule which made laser heatmap cells useless for shift analysis.
+    """
+    timestamps = events_by_station.get(station, ())
+    if not timestamps:
+        return {}
+    lo = bisect.bisect_left(timestamps, start_dt)
+    hi = bisect.bisect_right(timestamps, end_dt)
+    buckets = {}
+    for ts in timestamps[lo:hi]:
+        key = (ts.strftime("%Y-%m-%d"), ts.hour)
+        buckets[key] = buckets.get(key, 0) + 1
+    return buckets
+
+
 # =============================================================================
 # E. Main Parse Function
 # =============================================================================
@@ -712,6 +734,7 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
 
     for rec in unique_wo:
         rec["hole_count"] = 0
+        rec["_hole_buckets"] = {}
         if not is_production_work_order(rec.get("work_order", "")):
             continue
         try:
@@ -719,9 +742,13 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
             rec_end = datetime.datetime.strptime(rec["end_time"], "%Y/%m/%d %H:%M:%S")
         except (ValueError, KeyError, TypeError):
             continue
-        rec["hole_count"] = count_holes_in_range(
+        # Per-hour distribution — used for hourly_utilization buckets below.
+        # Total hole_count for the WO row in laser_work_orders is the sum.
+        buckets = holes_by_hour_in_range(
             events_by_station, rec.get("station", ""), rec_start, rec_end,
         )
+        rec["_hole_buckets"] = buckets
+        rec["hole_count"] = sum(buckets.values())
 
     # Determine current WO for machine_current_state. ProcTimeStart is only
     # trustworthy when the machine is actually RUN; in IDLE state the file
@@ -731,23 +758,19 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
     if state == "RUN" and start_records:
         last_wo = start_records[-1]["work_order"]
 
-    # Attribute each WO's hole_count to the hour of its end_time, so that
-    # dashboard "today's holes" (summed from hourly_utilization) reflects real
-    # laser drilling output. Only WOs finishing on the day being parsed are
-    # counted; WOs from other days belong to their own day's parse run.
+    # Attribute each WO's hole events to the actual hour each event happened
+    # (vs the previous logic that dumped all of a WO's holes into its end_time
+    # hour, breaking shift analysis whenever a WO spanned multiple hours).
+    # Only credits hours belonging to today's parse run — events that fell on
+    # other dates will be picked up when those dates are parsed.
     target_iso_date = "{}-{}-{}".format(date_str[:4], date_str[4:6], date_str[6:8])
     for rec in unique_wo:
-        if rec.get("hole_count", 0) <= 0:
-            continue
-        try:
-            end_dt = datetime.datetime.strptime(rec["end_time"], "%Y/%m/%d %H:%M:%S")
-        except (ValueError, TypeError):
-            continue
-        if end_dt.strftime("%Y-%m-%d") != target_iso_date:
-            continue
-        key = (target_iso_date, end_dt.hour)
-        if key in hourly:
-            hourly[key]["hole_count"] += rec["hole_count"]
+        for (date_key, hour), n in rec.get("_hole_buckets", {}).items():
+            if date_key != target_iso_date:
+                continue
+            key = (target_iso_date, hour)
+            if key in hourly:
+                hourly[key]["hole_count"] += n
 
     # ---- Write to database ----
     with get_db_connection(db_path) as conn:

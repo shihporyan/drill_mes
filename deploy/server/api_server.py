@@ -46,6 +46,25 @@ SINCE_FLICKER_SECONDS = 60
 DATA_START_DATE = "2026-04-01"
 
 
+def _bool_param(params, key, default):
+    """Parse a query-string param as bool. Accepts '1'/'0'/'true'/'false'/'yes'/'no'."""
+    v = params.get(key)
+    if v is None:
+        return default
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def _weekend_clause(include_weekends, date_col="date"):
+    """SQL fragment to exclude Sat/Sun from aggregate queries.
+
+    SQLite strftime('%w', text) returns 0 for Sunday, 6 for Saturday.
+    Returns empty string when weekends are included (no filter).
+    """
+    if include_weekends:
+        return ""
+    return " AND CAST(strftime('%w', {}) AS INTEGER) NOT IN (0, 6)".format(date_col)
+
+
 def compute_effective_since(conn, machine_id, state, db_since):
     """Return the start of the current uninterrupted state run, ignoring
     flickers (non-current-state gaps lasting <= SINCE_FLICKER_SECONDS).
@@ -410,11 +429,16 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
         """
         period = params.get("period", "day")
         date_str = params.get("date", datetime.date.today().isoformat())
+        # include_weekends defaults to False so weekday KPIs aren't diluted by
+        # mostly-idle Sat/Sun. Frontend exposes a toggle for analysts who want
+        # to see whether weekend overtime is producing.
+        include_weekends = _bool_param(params, "include_weekends", False)
         settings = self.server.settings
         target = settings.get("utilization_target", 75)
 
         with self._get_db() as conn:
             if period == "day":
+                # Single-day query: weekend filter is meaningless (caller chose the day).
                 if date_str < DATA_START_DATE:
                     rows = []
                     cursor = None
@@ -437,7 +461,6 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     return
                 week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
                 week_end = week_start + datetime.timedelta(days=6)
-                # Clamp lower bound to DATA_START_DATE.
                 effective_start = max(week_start.isoformat(), DATA_START_DATE)
                 cursor = conn.execute(
                     "SELECT machine_id, "
@@ -445,8 +468,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     "SUM(total_seconds) as total_seconds, "
                     "SUM(hole_count) as hole_count "
                     "FROM hourly_utilization "
-                    "WHERE date BETWEEN ? AND ? "
-                    "GROUP BY machine_id ORDER BY machine_id",
+                    "WHERE date BETWEEN ? AND ?" + _weekend_clause(include_weekends) +
+                    " GROUP BY machine_id ORDER BY machine_id",
                     (effective_start, week_end.isoformat()),
                 )
             elif period == "month":
@@ -458,8 +481,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     "SUM(total_seconds) as total_seconds, "
                     "SUM(hole_count) as hole_count "
                     "FROM hourly_utilization "
-                    "WHERE date LIKE ? AND date >= ? "
-                    "GROUP BY machine_id ORDER BY machine_id",
+                    "WHERE date LIKE ? AND date >= ?" + _weekend_clause(include_weekends) +
+                    " GROUP BY machine_id ORDER BY machine_id",
                     (month_prefix + "%", DATA_START_DATE),
                 )
             else:
@@ -524,6 +547,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
         level = params.get("level", "year")
         year = params.get("year", str(datetime.date.today().year))
         machine_type = params.get("type")
+        include_weekends = _bool_param(params, "include_weekends", False)
+        weekend_sql = _weekend_clause(include_weekends)
         settings = self.server.settings
         target = settings.get("utilization_target", 75)
 
@@ -555,7 +580,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                         "SELECT substr(date,6,2) as month, "
                         "SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
-                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + type_filter_sql +
+                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + weekend_sql + type_filter_sql +
                         " GROUP BY substr(date,6,2) ORDER BY month",
                         (year + "%", DATA_START_DATE) + type_filter_params,
                     )
@@ -617,7 +642,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     cursor = conn.execute(
                         "SELECT date, SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
-                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + type_filter_sql +
+                        "FROM hourly_utilization WHERE date LIKE ? AND date >= ?" + weekend_sql + type_filter_sql +
                         " GROUP BY date ORDER BY date",
                         (month_prefix + "%", DATA_START_DATE) + type_filter_params,
                     )
@@ -709,7 +734,7 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     cursor = conn.execute(
                         "SELECT date, SUM(run_seconds) as run, SUM(total_seconds) as total, "
                         "SUM(hole_count) as holes "
-                        "FROM hourly_utilization WHERE date BETWEEN ? AND ?" + type_filter_sql +
+                        "FROM hourly_utilization WHERE date BETWEEN ? AND ?" + weekend_sql + type_filter_sql +
                         " GROUP BY date ORDER BY date",
                         (effective_week_start, week_end.isoformat()) + type_filter_params,
                     )
@@ -775,6 +800,10 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
         """
         range_ = params.get("range", "day")
         date_str = params.get("date", datetime.date.today().isoformat())
+        # Weekend filter: only meaningful for week/month range. For single-day
+        # range we leave Sat/Sun rows alone (caller asked for that specific
+        # date).
+        include_weekends = _bool_param(params, "include_weekends", False)
 
         # Resolve [start, end] date range and bucket assignment for this granularity.
         if range_ == "week":
@@ -822,11 +851,15 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
 
         with self._get_db() as conn:
             effective_start = max(start.isoformat(), DATA_START_DATE)
+            # Apply weekend filter only for multi-day ranges; a day-mode caller
+            # has already chosen the date so we honour their request even if
+            # it falls on Sat/Sun.
+            heat_weekend_sql = _weekend_clause(include_weekends) if range_ != "day" else ""
             cursor = conn.execute(
                 "SELECT machine_id, date, hour, run_seconds, total_seconds, hole_count "
                 "FROM hourly_utilization "
-                "WHERE date BETWEEN ? AND ? "
-                "ORDER BY machine_id, date, hour",
+                "WHERE date BETWEEN ? AND ?" + heat_weekend_sql +
+                " ORDER BY machine_id, date, hour",
                 (effective_start, end.isoformat()),
             )
             rows = cursor.fetchall()
