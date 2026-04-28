@@ -128,7 +128,7 @@ def _backfill_laser(db_path, machine_id, machine_dir, target_date):
     """Backfill Kataoka laser drill logs."""
     parsed = 0
     programs_dir = os.path.join(machine_dir, "programs")
-    lsr_dir = os.path.join(machine_dir, "lsr_files")
+    backup_root = os.path.dirname(machine_dir)
 
     # Scan date directories (YYYYMMDD format)
     date_dirs = sorted(d for d in os.listdir(machine_dir)
@@ -142,7 +142,10 @@ def _backfill_laser(db_path, machine_id, machine_dir, target_date):
         logger.info("[%s] Parsing laser logs for %s", machine_id, date_dir)
 
         try:
-            parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, date_dir)
+            parse_laser_machine(
+                db_path, machine_id, log_dir, programs_dir, date_dir,
+                backup_root=backup_root,
+            )
             parsed += 1
         except Exception as e:
             logger.error("[%s] Error parsing laser logs for %s: %s", machine_id, date_dir, e, exc_info=True)

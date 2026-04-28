@@ -4,9 +4,10 @@ Kataoka Laser Drill log parser.
 Parses multiple log files from Kataoka laser drilling machines:
 - ClsLaserCom.log: RUN state detection (auto-run alarm add/delete)
 - PhysicalMemory.log: Power-on time detection (heartbeat)
-- ClsPLCTrd.log: IDLE/STOP/OFFLINE state detection
+- ClsPLCTrd.log: IDLE/STOP/OFFLINE state detection + per-hole drill events
+  ("本加工データ取得 加工基盤番号:N", cross-confirmed 1:1 with L1 Process.dat
+  on 2026-04-28)
 - ProcTimeEnd.txt / ProcTimeStart.txt: Work order tracking
-- LSR files: Hole count extraction
 
 Supports incremental parsing via parse_progress table.
 
@@ -15,12 +16,12 @@ Usage:
     python parsers/laser_log_parser.py --loop
 """
 
+import bisect
 import csv
 import datetime
 import glob
 import io
 import logging
-import ntpath
 import os
 import re
 import sqlite3
@@ -59,13 +60,17 @@ PANEL_WAIT = "パネル操作待ち"
 # Timestamp pattern in log lines: YYYY/MM/DD HH:MM:SS:mmm
 TS_PATTERN = re.compile(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}:\d{3})")
 
-# Count pattern in LSR files: Count:NNN (case-insensitive)
-LSR_COUNT_PATTERN = re.compile(r"Count:(\d+)", re.IGNORECASE)
-LSR_ALIGNMENT_PATTERN = re.compile(r"alignment;count", re.IGNORECASE)
+# Per-hole drill events in ClsPLCTrd. Each match = one successfully drilled
+# hole on station N. The leading timestamp lets us bucket by batch time range.
+# Cross-confirmed 1:1 with L1 Process.dat on 2026-04-28 (3916 events vs 3916
+# holes for ST3, 3928 vs 3928 for ST5).
+BEAM_HOLE_PATTERN = re.compile(
+    r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}).*本加工データ取得.*加工基盤番号:(\d+)"
+)
 
 # Work order naming rule: only WOs whose name contains "WD" or "GR" get
-# hole_count computed from their LSR file. All other WOs (test jobs, SCM etc.)
-# are still tracked in laser_work_orders, but with hole_count=0.
+# hole_count computed. All other WOs (test jobs, SCM etc.) are still tracked
+# in laser_work_orders, but with hole_count=0.
 def is_production_work_order(wo_name):
     """Return True if this WO name qualifies for hole-count extraction."""
     if not wo_name:
@@ -462,17 +467,22 @@ def parse_proc_time_end(filepath):
 
 
 def parse_proc_time_start(filepath):
-    """Parse ProcTimeStart.txt to extract current in-progress work order.
+    """Parse ProcTimeStart.txt to extract the currently-running work order.
 
-    Format (overwritten each new job):
-    - Time line: "station","start_time","end_time","duration_secs"
-    - Detail line: "station","wo_name","lsr_path","machine_type","power"
+    Format (overwritten each time a station starts a new job):
+    - Time line: "trigger_station","start_time","end_time","duration_secs"
+    - Detail lines: "station","wo_name","lsr_path","machine_type","power"
+      (one per panel-configured station; only the one matching trigger_station
+      is actually running — others are panel residuals)
+
+    Cross-confirmed via ClsPLCTrd 加工基盤番号 trace 2026/04/27: only the
+    trigger-station detail represents a currently-running job.
 
     Args:
         filepath: Path to ProcTimeStart.txt file.
 
     Returns:
-        list of dicts (usually 0 or 1 record).
+        list of dicts (0 or 1 record).
     """
     if not filepath or not os.path.exists(filepath):
         return []
@@ -497,8 +507,7 @@ def parse_proc_time_start(filepath):
         if not fields:
             continue
 
-        # ProcTimeStart has station as first field in time line
-        # Detect: first field is a small number (station), second is datetime
+        # Time line: ["trigger_station", "YYYY/MM/DD HH:MM:SS", "...", "duration"]
         if (len(fields) >= 4 and
                 re.match(r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}", fields[1])):
             current_time_row = {
@@ -509,6 +518,9 @@ def parse_proc_time_start(filepath):
             }
         elif current_time_row and len(fields) >= 3:
             station = fields[0]
+            if station != current_time_row["station"]:
+                # Panel residual from another station — not currently running.
+                continue
             wo_name = fields[1]
             lsr_path = fields[2] if len(fields) > 2 else ""
 
@@ -526,45 +538,78 @@ def parse_proc_time_start(filepath):
 
 
 # =============================================================================
-# D. Hole Count from LSR Files
+# D. Hole Count from ClsPLCTrd Beam-OK Events
 # =============================================================================
 
-def extract_hole_count_from_lsr(filepath):
-    """Extract total hole count from an LSR coordinate file.
+def find_plc_log_path(backup_root, machine_id, date_obj):
+    """Build the local backup ClsPLCTrd.log path for a specific date."""
+    date_str = date_obj.strftime("%Y%m%d")
+    return os.path.join(
+        backup_root, machine_id, date_str, "{}_ClsPLCTrd.log".format(date_str)
+    )
 
-    Finds all 'Count:NNN' values in header lines and sums them.
-    Skips alignment lines (containing 'alignment;count').
+
+def load_beam_events_by_station(backup_root, machine_id, start_date, end_date):
+    """Scan daily ClsPLCTrd logs for per-hole drill events.
+
+    Reads each YYYYMMDD_ClsPLCTrd.log between start_date and end_date
+    (inclusive) and extracts every "本加工データ取得 加工基盤番号:N" event,
+    bucketed by station. Caller can then bisect into a station's timestamp
+    list to count holes drilled within any [start, end] sub-range.
 
     Args:
-        filepath: Path to .lsr file (read as text).
+        backup_root: Root directory of log backups.
+        machine_id: Machine identifier (e.g. 'L2').
+        start_date: datetime.date — first day to scan, inclusive.
+        end_date: datetime.date — last day to scan, inclusive.
 
     Returns:
-        int: Total hole count, or 0 if file not found.
+        dict mapping station number string → sorted list of datetime objects.
     """
-    if not filepath or not os.path.exists(filepath):
+    events = {}
+    cursor = start_date
+    while cursor <= end_date:
+        plc_path = find_plc_log_path(backup_root, machine_id, cursor)
+        if os.path.exists(plc_path):
+            try:
+                with open(plc_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m = BEAM_HOLE_PATTERN.match(line)
+                        if not m:
+                            continue
+                        try:
+                            ts = datetime.datetime.strptime(
+                                m.group(1), "%Y/%m/%d %H:%M:%S"
+                            )
+                        except ValueError:
+                            continue
+                        events.setdefault(m.group(2), []).append(ts)
+            except Exception as e:
+                logger.warning(
+                    "[%s] Error scanning PLC log %s: %s",
+                    machine_id, plc_path, e,
+                )
+        cursor += datetime.timedelta(days=1)
+    for station in events:
+        events[station].sort()
+    return events
+
+
+def count_holes_in_range(events_by_station, station, start_dt, end_dt):
+    """Count drilled-hole events on a station within [start_dt, end_dt]."""
+    timestamps = events_by_station.get(station, ())
+    if not timestamps:
         return 0
-
-    total = 0
-    try:
-        with open(filepath, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                # Skip alignment lines
-                if LSR_ALIGNMENT_PATTERN.search(line):
-                    continue
-                # Find Count:NNN patterns
-                for m in LSR_COUNT_PATTERN.finditer(line):
-                    total += int(m.group(1))
-    except Exception as e:
-        logger.warning("Failed to read LSR file %s: %s", filepath, e)
-
-    return total
+    lo = bisect.bisect_left(timestamps, start_dt)
+    hi = bisect.bisect_right(timestamps, end_dt)
+    return hi - lo
 
 
 # =============================================================================
 # E. Main Parse Function
 # =============================================================================
 
-def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, date_str):
+def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, backup_root=None):
     """Parse all laser log files for one machine and one date, write to DB.
 
     Args:
@@ -572,9 +617,13 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, dat
         machine_id: Machine identifier (e.g. 'L2').
         log_dir: Directory containing system logs for this date.
         programs_dir: Directory containing ProcTimeEnd/ProcTimeStart files.
-        lsr_dir: Directory containing copied LSR files.
         date_str: Date string like '20260407'.
+        backup_root: Root backup directory; needed to span PLC logs across
+            cross-midnight batches. If None, derived from log_dir's grandparent.
     """
+    if backup_root is None:
+        backup_root = os.path.dirname(os.path.dirname(log_dir))
+
     # Find log files
     laser_com_path = find_log_file(log_dir, date_str, "ClsLaserCom")
     pm_path = find_log_file(log_dir, date_str, "PhysicalMemory")
@@ -608,20 +657,22 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, dat
     # B. Detect current state
     state, since = detect_current_state(laser_com_path, plc_path, pm_first, pm_last)
 
-    # C. Parse work orders
+    # C. Parse work orders. Track ProcTimeEnd (historical, completed batches)
+    # and ProcTimeStart (the *current* batch from operator panel) separately:
+    # ProcTimeStart's first detail is the live "currently running" signal
+    # (subject to RUN state); ProcTimeEnd populates the historical table.
     # Production uses .log extension, legacy dev uses .txt. Support both.
-    wo_records = []
+    end_records = []
+    start_records = []
     if programs_dir:
-        # Find ProcTimeEnd files (monthly). Collect into a set to deduplicate.
         end_files = set()
         for ext in ("log", "txt"):
             for pattern in ("*_ProcTimeEnd.{}".format(ext), "*ProcTimeEnd.{}".format(ext)):
                 end_files.update(glob.glob(os.path.join(programs_dir, "**", pattern), recursive=True))
                 end_files.update(glob.glob(os.path.join(programs_dir, pattern)))
         for f in end_files:
-            wo_records.extend(parse_proc_time_end(f))
+            end_records.extend(parse_proc_time_end(f))
 
-        # Find ProcTimeStart files
         start_files = set()
         for ext in ("log", "txt"):
             pattern = "ProcTimeStart.{}".format(ext)
@@ -630,38 +681,55 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, dat
             if os.path.exists(direct):
                 start_files.add(direct)
         for f in start_files:
-            wo_records.extend(parse_proc_time_start(f))
+            start_records.extend(parse_proc_time_start(f))
 
-    # Deduplicate work orders by (start_time, station)
+    # Combine + dedupe by (start_time, station). End records come first so
+    # that an in-progress ProcTimeStart entry overrides its (likely identical)
+    # twin if both exist.
     seen = set()
     unique_wo = []
-    for rec in wo_records:
+    for rec in list(end_records) + list(start_records):
         key = (rec["start_time"], rec["station"])
         if key not in seen:
             seen.add(key)
             unique_wo.append(rec)
 
-    # D. Extract hole counts from LSR files.
-    # Only compute for WOs whose name contains "WD" or "GR"; other WOs (test
-    # jobs, SCM experiments, etc.) keep hole_count=0 per product rule.
-    # Use ntpath.basename so Windows paths like
-    # 'C:\Users\KATAOKA\Desktop\foo.lsr' are split correctly on Mac too.
+    # D. Compute hole counts from ClsPLCTrd "本加工データ取得 加工基盤番号:N"
+    # events. Replaces previous LSR-based logic since the operator Desktop
+    # share isn't accessible. Cross-confirmed 1:1 with L1 Process.dat
+    # 2026-04-28 (3916 vs 3916, 3928 vs 3928).
+    #
+    # Optimization: load all events for today ± 1 day once, then bisect per
+    # record. Records outside this window keep hole_count=0; older batches
+    # were processed in earlier parser runs (or had no PLC log available).
+    today_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+    events_by_station = load_beam_events_by_station(
+        backup_root,
+        machine_id,
+        today_date - datetime.timedelta(days=1),
+        today_date + datetime.timedelta(days=1),
+    )
+
     for rec in unique_wo:
         rec["hole_count"] = 0
         if not is_production_work_order(rec.get("work_order", "")):
             continue
-        lsr_path = rec.get("lsr_file_path", "")
-        if not lsr_path or not lsr_dir:
+        try:
+            rec_start = datetime.datetime.strptime(rec["start_time"], "%Y/%m/%d %H:%M:%S")
+            rec_end = datetime.datetime.strptime(rec["end_time"], "%Y/%m/%d %H:%M:%S")
+        except (ValueError, KeyError, TypeError):
             continue
-        lsr_basename = ntpath.basename(lsr_path)
-        local_lsr = os.path.join(lsr_dir, lsr_basename)
-        if os.path.exists(local_lsr):
-            rec["hole_count"] = extract_hole_count_from_lsr(local_lsr)
+        rec["hole_count"] = count_holes_in_range(
+            events_by_station, rec.get("station", ""), rec_start, rec_end,
+        )
 
-    # Get the latest work order for machine_current_state
+    # Determine current WO for machine_current_state. ProcTimeStart is only
+    # trustworthy when the machine is actually RUN; in IDLE state the file
+    # retains the *previous* batch's last station (verified 2026-04-28 on L2:
+    # batch ended 05:20, ProcTimeStart still showed last station at 13:09).
     last_wo = None
-    for rec in unique_wo:
-        last_wo = rec["work_order"]
+    if state == "RUN" and start_records:
+        last_wo = start_records[-1]["work_order"]
 
     # Attribute each WO's hole_count to the hour of its end_time, so that
     # dashboard "today's holes" (summed from hourly_utilization) reflects real
@@ -815,10 +883,12 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
         machine_id = machine["id"]
         log_dir = os.path.join(backup_root, machine_id, date_str)
         programs_dir = os.path.join(backup_root, machine_id, "programs")
-        lsr_dir = os.path.join(backup_root, machine_id, "lsr_files")
 
         try:
-            parse_laser_machine(db_path, machine_id, log_dir, programs_dir, lsr_dir, date_str)
+            parse_laser_machine(
+                db_path, machine_id, log_dir, programs_dir, date_str,
+                backup_root=backup_root,
+            )
         except Exception as e:
             logger.error("[%s] Laser parser error: %s", machine_id, e, exc_info=True)
 
