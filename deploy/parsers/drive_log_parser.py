@@ -30,7 +30,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from parsers.base_parser import (
     load_machines_config,
     load_settings,
-    get_enabled_machines,
+    get_machines_by_type,
     get_backup_root,
     get_db_path,
     get_db_connection,
@@ -43,7 +43,12 @@ from parsers.base_parser import (
 logger = logging.getLogger(__name__)
 
 VALID_STATES = {"RUN", "RESET", "STOP"}
-WO_PATTERN = re.compile(r"^(O|GR)(\d+)\.(B|T)\d*$", re.IGNORECASE)
+# Accept an optional "-N" variant suffix between the digits and the side
+# letter, e.g. "O2603035-2.B" (revision 2 of O2603035, bottom side). Operators
+# create variant programs by appending "-N" when reissuing the same WO; without
+# this branch the parser falls through and machine_current_state.work_order
+# stays anchored on the previous match (M14/M18 incident, 2026-04-28).
+WO_PATTERN = re.compile(r"^(O|GR)(\d+)(-\d+)?\.(B|T)\d*$", re.IGNORECASE)
 
 # Max seconds to attribute from a single gap between consecutive rows.
 # Gaps within this limit are assumed to be the same state (firmware skip).
@@ -88,17 +93,20 @@ def extract_work_order(program):
     """Extract work order and side from a production program name.
 
     Args:
-        program: Program name from Drive.Log (e.g. 'O2604016.B', 'GR2604003.T').
+        program: Program name from Drive.Log (e.g. 'O2604016.B', 'GR2604003.T',
+            'O2603035-2.B').
 
     Returns:
-        tuple: (work_order, side) e.g. ('O2604016', 'B'), or (None, None).
+        tuple: (work_order, side) e.g. ('O2604016', 'B') or
+            ('O2603035-2', 'B') for a variant. (None, None) on no match.
     """
     if not program:
         return None, None
     m = WO_PATTERN.match(program.strip())
     if m:
         prefix = m.group(1).upper()
-        return "{}{}".format(prefix, m.group(2)), m.group(3).upper()
+        variant = m.group(3) or ""
+        return "{}{}{}".format(prefix, m.group(2), variant), m.group(4).upper()
     return None, None
 
 
@@ -576,9 +584,9 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
     if db_path is None:
         db_path = get_db_path(settings)
 
-    enabled = get_enabled_machines(machines_config)
+    enabled = get_machines_by_type(machines_config, "takeuchi")
     if not enabled:
-        logger.warning("No enabled machines found in config.")
+        logger.warning("No enabled Takeuchi machines found in config.")
         return
 
     today = datetime.date.today()

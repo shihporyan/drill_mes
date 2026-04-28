@@ -860,5 +860,117 @@ class TestParserWithFixture(unittest.TestCase):
                          "Transition count: got {} expected {}".format(count, GOLDEN_TRANSITION_COUNT))
 
 
+class TestExtractWorkOrderVariants(unittest.TestCase):
+    """WO_PATTERN must accept the '-N' variant suffix some operators add when
+    reissuing the same work order (e.g. 'O2603035-2.B'). M14/M18 incident
+    on 2026-04-28: the regex rejected the '-2' form, TX1 parser silently
+    skipped the LOAD event, and machine_current_state.work_order stayed
+    anchored on the previous match for ~20h."""
+
+    def test_variant_suffix_accepted(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(
+            extract_work_order("O2603035-2.B"),
+            ("O2603035-2", "B"),
+            "hyphen-N variant must be carried into work_order so distinct "
+            "reissues remain distinguishable on the dashboard",
+        )
+
+    def test_canonical_forms_unchanged(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(extract_work_order("O2604016.B"), ("O2604016", "B"))
+        self.assertEqual(extract_work_order("GR2604003.T"), ("GR2604003", "T"))
+        # Trailing digit after side (existing format from B1/T1 fixtures).
+        self.assertEqual(extract_work_order("O2604055.B1"), ("O2604055", "B"))
+
+    def test_non_wo_rejected(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(extract_work_order("O100.txt"), (None, None))
+        self.assertEqual(extract_work_order("LASER-URA.T"), (None, None))
+        self.assertEqual(extract_work_order(""), (None, None))
+
+
+class TestComputeEffectiveSince(unittest.TestCase):
+    """Effective since must collapse <=60s same-state flickers (operator
+    pause/resume transients).
+
+    Reproduces the M14 trace from 2026-04-28: machine ran continuously for
+    ~18h with three brief STOP transients (4s, 26s, 16s) and one cluster of
+    rapid RUN/RESET/STOP toggles during setup. db_since pointed at the most
+    recent RUN entry (~13min ago in the snapshot), but the dashboard should
+    show the start of the continuous run (>18h ago)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _add(self, ts, frm, to):
+        self.conn.execute(
+            "INSERT INTO state_transitions "
+            "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+            "VALUES ('M14', ?, ?, ?, 'O100.txt', '000', 0.0)",
+            (ts, frm, to),
+        )
+
+    def test_collapses_short_stop_flickers(self):
+        from server.api_server import compute_effective_since
+        # Continuous RUN started 16:00:00, with two brief STOP flickers later.
+        self._add("2026-04-27T16:00:00", "STOP", "RUN")
+        self._add("2026-04-27T18:00:00", "RUN", "STOP")
+        self._add("2026-04-27T18:00:30", "STOP", "RUN")  # 30s gap — flicker
+        self._add("2026-04-28T08:00:00", "RUN", "STOP")
+        self._add("2026-04-28T08:00:15", "STOP", "RUN")  # 15s gap — flicker
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-28T08:00:15")
+        self.assertEqual(eff, "2026-04-27T16:00:00",
+                         "must walk back through both 30s and 15s STOP "
+                         "flickers and anchor on the original RUN entry")
+
+    def test_stops_on_long_gap(self):
+        from server.api_server import compute_effective_since
+        self._add("2026-04-27T08:00:00", "STOP", "RUN")
+        self._add("2026-04-27T18:00:00", "RUN", "STOP")
+        # 5-minute STOP — too long, must NOT be collapsed.
+        self._add("2026-04-27T18:05:00", "STOP", "RUN")
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-27T18:05:00")
+        self.assertEqual(eff, "2026-04-27T18:05:00",
+                         "5-minute gap exceeds flicker threshold; effective "
+                         "since must stay on the latest RUN entry")
+
+    def test_collapses_multi_hop_flicker(self):
+        from server.api_server import compute_effective_since
+        # M18-shaped pattern: RUN -> STOP -> RESET -> STOP -> RUN within 60s.
+        # The walk-back must find the RUN exit (not the immediately-prior
+        # transition) and measure the full RUN-to-RUN gap.
+        self._add("2026-04-27T16:00:00", "STOP", "RUN")
+        self._add("2026-04-27T17:00:00", "RUN", "STOP")
+        self._add("2026-04-27T17:00:24", "STOP", "RESET")
+        self._add("2026-04-27T17:00:36", "RESET", "STOP")
+        self._add("2026-04-27T17:00:37", "STOP", "RUN")
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-27T17:00:37")
+        self.assertEqual(eff, "2026-04-27T16:00:00",
+                         "RUN-to-RUN gap was 37s through STOP/RESET/STOP — "
+                         "must collapse and walk back to the earlier RUN")
+
+    def test_falls_back_to_db_since_when_no_transitions(self):
+        from server.api_server import compute_effective_since
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-28T10:00:00")
+        self.assertEqual(eff, "2026-04-28T10:00:00",
+                         "fresh DB with no transitions must return db_since")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -30,6 +30,75 @@ from parsers.base_parser import load_settings, load_machines_config, get_db_path
 
 logger = logging.getLogger(__name__)
 
+# Maximum non-current-state gap that still counts as a "flicker" when computing
+# effective_since. Operators routinely tap RESET/STOP for a few seconds during
+# tool changes or pauses, then resume the same RUN; without this collapse the
+# dashboard duration re-anchors on every tap and never reflects the actual
+# continuous run length (M14/M18 incident, 2026-04-28: 18h true run displayed
+# as 2h-3h because of 4-32s STOP transients).
+SINCE_FLICKER_SECONDS = 60
+
+
+def compute_effective_since(conn, machine_id, state, db_since):
+    """Return the start of the current uninterrupted state run, ignoring
+    flickers (non-current-state gaps lasting <= SINCE_FLICKER_SECONDS).
+
+    Walks state_transitions DESC starting from the most recent ?->state row;
+    for each immediately-prior state->? exit, if the gap to the next ?->state
+    re-entry is short enough, treats the gap as a flicker and continues
+    walking back. Stops on the first sustained gap or when transitions
+    run out.
+
+    Returns the iso timestamp string. Falls back to db_since if state_transitions
+    has no row for this machine + state (fresh DB / new machine).
+    """
+    cursor = conn.execute(
+        "SELECT timestamp, from_state, to_state FROM state_transitions "
+        "WHERE machine_id=? ORDER BY timestamp DESC LIMIT 500",
+        (machine_id,),
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    if not rows:
+        return db_since
+
+    # Index of the most recent transition into the current state.
+    i = 0
+    while i < len(rows) and rows[i]["to_state"] != state:
+        i += 1
+    if i >= len(rows):
+        return db_since
+    since = rows[i]["timestamp"]
+
+    while True:
+        # Find the most recent state->? exit older than `since`. The gap
+        # between that exit and `since` is the time we spent outside the
+        # current state. (Skipping rows where from_state != state lets us
+        # collapse multi-hop flickers like RUN->STOP->RESET->STOP->RUN.)
+        k = i + 1
+        while k < len(rows) and rows[k]["from_state"] != state:
+            k += 1
+        if k >= len(rows):
+            break
+        try:
+            gap = (datetime.datetime.fromisoformat(since)
+                   - datetime.datetime.fromisoformat(rows[k]["timestamp"])
+                   ).total_seconds()
+        except (ValueError, TypeError):
+            break
+        if gap > SINCE_FLICKER_SECONDS:
+            break
+
+        # Walk back to the ?->state entry that started this earlier run.
+        j = k + 1
+        while j < len(rows) and rows[j]["to_state"] != state:
+            j += 1
+        if j >= len(rows):
+            break
+        since = rows[j]["timestamp"]
+        i = j
+
+    return since
+
 
 class DrillAPIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for drill monitoring API."""
@@ -197,6 +266,17 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+            # Pre-compute flicker-collapsed since for each machine in current
+            # state — done inside the with block so the connection stays open.
+            effective_since = {}
+            for mid, sd in state_rows.items():
+                st = sd.get("state")
+                db_since = sd.get("since")
+                if st in ("RUN", "RESET", "STOP") and db_since:
+                    effective_since[mid] = compute_effective_since(
+                        conn, mid, st, db_since,
+                    )
+
         # Build machine list
         machines = []
         summary = {"running": 0, "idle": 0, "stopped": 0, "offline": 0, "total": len(all_machines)}
@@ -212,7 +292,11 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
 
             if state_data:
                 state = state_data.get("state", "UNKNOWN")
-                since = state_data.get("since", "")
+                # `since` here is the flicker-collapsed start of the current
+                # state run (ignores <=60s operator pauses); falls back to
+                # the raw machine_current_state.since when transitions
+                # haven't been recorded yet.
+                since = effective_since.get(mid) or state_data.get("since", "")
                 duration_minutes = 0
                 if since:
                     try:

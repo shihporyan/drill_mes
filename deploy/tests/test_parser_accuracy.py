@@ -429,6 +429,381 @@ class TestParserWithGappedData(unittest.TestCase):
                          "Hour 11 should get 9s (from gap) + 1s (last row)")
 
 
+class TestParserPeekAheadReplay(unittest.TestCase):
+    """Test that cross-batch peek-ahead replay does not double-count.
+
+    Scenario: firmware writes a future-timestamped "peek-ahead" row to the
+    log (e.g. at 10:00:30), then in a later flush writes the real rows that
+    fill in the earlier timestamps (10:00:05, :06, :07, :08). When the
+    parser runs twice (once before and once after the fill-in), the second
+    batch's rows have timestamps earlier than the last_timestamp recorded
+    by the first batch. Without handling this, hourly_utilization is
+    over-counted and state_transitions contain duplicates.
+    """
+
+    DATE_STR = "2026/04/10"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "10Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, time_str, state, counter):
+        """Format one Drive.Log CSV row."""
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=self.DATE_STR, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _write(self, rows):
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def test_peek_ahead_replay_does_not_double_count(self):
+        """Two parse calls with peek-ahead fill-in should total same as one parse."""
+        # Batch 1: real rows 10:00:00-04 (RUN) + peek-ahead at 10:00:30 (RUN).
+        # Counter increments monotonically: 100..104 for real rows, 130 for
+        # peek-ahead (simulating firmware projecting forward).
+        batch1_rows = [
+            self._row("10:00:00", "RUN", 100),
+            self._row("10:00:01", "RUN", 101),
+            self._row("10:00:02", "RUN", 102),
+            self._row("10:00:03", "RUN", 103),
+            self._row("10:00:04", "RUN", 104),
+            self._row("10:00:30", "RUN", 130),
+        ]
+        self._write(batch1_rows)
+        parse_log_file(self.db_path, "M13", self.log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            after_batch1 = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+        self.assertIsNotNone(after_batch1, "Batch 1 should produce hour-10 row")
+
+        # Batch 2: same file + filler rows 10:00:05-08 appended AFTER the
+        # peek-ahead line (firmware writes real rows later) + next real row
+        # at 10:00:31. The filler timestamps are earlier than the peek-ahead.
+        batch2_rows = batch1_rows + [
+            self._row("10:00:05", "RUN", 105),
+            self._row("10:00:06", "RUN", 106),
+            self._row("10:00:07", "RUN", 107),
+            self._row("10:00:08", "RUN", 108),
+            self._row("10:00:31", "RUN", 131),
+        ]
+        self._write(batch2_rows)
+        parse_log_file(self.db_path, "M13", self.log_path, "10")
+
+        with sqlite3.connect(self.db_path) as conn:
+            run_sec, holes = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+            trans_count = conn.execute(
+                "SELECT COUNT(*) FROM state_transitions WHERE machine_id='M13'"
+            ).fetchone()[0]
+            dup_count = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM state_transitions "
+                "WHERE machine_id='M13' GROUP BY timestamp HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+
+        # Oracle: parse the final file once from a clean DB.
+        oracle_db = os.path.join(self.temp_dir, "oracle.db")
+        init_database(oracle_db)
+        parse_log_file(oracle_db, "M13", self.log_path, "10")
+        with sqlite3.connect(oracle_db) as conn:
+            oracle_run, oracle_holes = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND hour=10"
+            ).fetchone()
+
+        self.assertEqual(run_sec, oracle_run,
+                         "Two-batch parse with replay should match single-pass parse "
+                         "(got run_seconds={}, oracle={})".format(run_sec, oracle_run))
+        self.assertEqual(holes, oracle_holes,
+                         "Hole count should match single-pass parse "
+                         "(got {}, oracle {})".format(holes, oracle_holes))
+        self.assertEqual(dup_count, 0,
+                         "No duplicate state_transitions should exist after replay "
+                         "(found {} duplicated timestamps)".format(dup_count))
+        self.assertLessEqual(run_sec, 3600,
+                             "Hour total cannot exceed 3600s, got {}".format(run_sec))
+
+
+class TestParserSinceFromTransitions(unittest.TestCase):
+    """Verify machine_current_state.since is derived from state_transitions,
+    not propagated from a prior DB value.
+
+    Scenario (M05 2026-04-26 cross-month stall observed in production):
+    1. Old monthly file content was parsed first, recording a transition at
+       2026-03-26T23:58:03 (RUN→STOP) and seeding since to that timestamp.
+    2. After the actual monthly rollover, a fresh batch lands containing
+       only RESET rows; prev_state from DB still says STOP from step 1.
+    3. The transitions table picks up the STOP→RESET entry inside this
+       batch, but the legacy since logic, hitting the all-same-state-in-
+       batch fallback, used to copy DB's existing since forward — anchoring
+       it to 3/26 indefinitely until a future batch happened to mix states.
+
+    The fix queries state_transitions for the most recent to_state==current
+    state row and uses its timestamp. This stays correct under every
+    backfill / cross-month / sticky-state pattern we have hit.
+    """
+
+    DATE = "2026/04/26"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "26Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, time_str, state, counter, date_str=None):
+        d = date_str or self.DATE
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=d, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _seed_stale_state(self):
+        """Mimic the post-bug state: machine_current_state.since pointing at
+        an old month, plus a state_transitions row from that period. This is
+        the snapshot the production DB had on 2026-04-27 for M05."""
+        with sqlite3.connect(self.db_path) as conn:
+            # Stale March transitions
+            conn.execute(
+                "INSERT INTO state_transitions "
+                "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+                "VALUES ('M05', '2026-03-26T23:58:03', 'RUN', 'STOP', 'O100.txt', '001', 0.088)"
+            )
+            # machine_current_state pointing at the old month with state=STOP.
+            conn.execute(
+                "INSERT INTO machine_current_state "
+                "(machine_id, state, mode, program, tool_num, drill_dia, since, last_update, counter) "
+                "VALUES ('M05', 'STOP', 'MAN', '', '000', 0.0, "
+                " '2026-03-26T23:58:03', '2026-03-26T23:58:03', 100000000)"
+            )
+            conn.commit()
+
+    def test_since_updates_via_transition_in_same_batch(self):
+        """First batch carrying the STOP→RESET transition must move since to
+        the transition timestamp, not leave it on the stale March value."""
+        self._seed_stale_state()
+
+        rows = [
+            # Final STOP row — triggers STOP→RESET on the next row
+            self._row("00:00:00", "STOP", 100000000),
+            self._row("00:00:01", "RESET", 100000001),
+            self._row("00:00:02", "RESET", 100000002),
+            self._row("00:00:03", "RESET", 100000003),
+        ]
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+        parse_log_file(self.db_path, "M05", self.log_path, "26")
+
+        with sqlite3.connect(self.db_path) as conn:
+            since, state = conn.execute(
+                "SELECT since, state FROM machine_current_state WHERE machine_id='M05'"
+            ).fetchone()
+        self.assertEqual(state, "RESET")
+        self.assertEqual(since, "2026-04-26T00:00:01",
+                         "since must point at the RESET-entry transition in this batch, "
+                         "not the stale March value")
+
+    def test_since_uses_latest_transition_when_batch_is_steady_state(self):
+        """A subsequent quiet batch (all RESET, prev_state matches) must
+        still anchor since to the latest transitions row, not the DB's
+        old since column."""
+        self._seed_stale_state()
+        # Pre-seed a fresh STOP→RESET transition that the parser must honor.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO state_transitions "
+                "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+                "VALUES ('M05', '2026-04-25T23:51:41', 'STOP', 'RESET', 'O100.txt', '000', 0.150)"
+            )
+            # Update DB state to RESET so prev_state will match the batch.
+            conn.execute(
+                "UPDATE machine_current_state SET state='RESET' WHERE machine_id='M05'"
+            )
+            conn.commit()
+
+        # Quiet batch — only RESET rows, all matching prev_state.
+        rows = [self._row("12:00:{:02d}".format(i), "RESET", 100000010 + i)
+                for i in range(5)]
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+        parse_log_file(self.db_path, "M05", self.log_path, "26")
+
+        with sqlite3.connect(self.db_path) as conn:
+            since = conn.execute(
+                "SELECT since FROM machine_current_state WHERE machine_id='M05'"
+            ).fetchone()[0]
+        self.assertEqual(since, "2026-04-25T23:51:41",
+                         "since must come from the most recent to_state=RESET "
+                         "row in state_transitions, not the stale 2026-03-26 "
+                         "value still in machine_current_state")
+
+
+class TestParserCrossMidnightReplay(unittest.TestCase):
+    """Test that peek-ahead replay in a file with cross-midnight rows does
+    NOT wipe prior-day data.
+
+    Scenario: 23Drive.Log starts with a handful of 22-dated rows (firmware
+    buffer flushing past midnight) followed by 23-dated rows. If a peek-
+    ahead replay triggers a full re-parse of 23Drive.Log, we must only
+    rebuild 23's hourly_utilization and leave 22's data (owned by
+    22Drive.Log's own parse) untouched.
+
+    Bug: before this fix, the DELETE step wiped hourly rows for every date
+    appearing in 23Drive.Log's parsed rows. That destroyed 22's data, then
+    re-attributed only a few stray cross-midnight seconds back — severe
+    undercount on the prior day.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.log_path = os.path.join(self.temp_dir, "23Drive.Log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, date_str, time_str, state, counter):
+        mode = "AUTO" if state == "RUN" else "MAN"
+        prog = "O100.txt" if state == "RUN" else ""
+        tool = "084" if state == "RUN" else "000"
+        dia = "1.000" if state == "RUN" else "0.150"
+        return ("{date},{t},{m},{s},{p},20.142,276.228,{tl},{d},0000,"
+                "{c},1,0,0,0,0,0,0.000,0.000,0.000,0.000,0.000,0.000").format(
+            date=date_str, t=time_str, m=mode, s=state, p=prog,
+            tl=tool, d=dia, c=counter,
+        )
+
+    def _write(self, rows):
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def _seed_prior_day(self):
+        """Put realistic 22nd-of-month hourly data into DB (as if 22Drive.Log
+        had already been parsed). Hour 23 has 3500s RUN, 100 holes."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO hourly_utilization "
+                "(machine_id, date, hour, run_seconds, reset_seconds, "
+                "stop_seconds, total_seconds, utilization, hole_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("M13", "2026-04-22", 23, 3500, 100, 0, 3600, 97.2, 100),
+            )
+            conn.commit()
+
+    def test_replay_preserves_prior_day_hourly(self):
+        # Simulate real production: 22's hourly row is already in DB.
+        self._seed_prior_day()
+
+        # 23Drive.Log: 3 cross-midnight rows from 22 (23:59:57/58/59), then
+        # 23-dated rows with a peek-ahead at 00:00:30, then a filler batch.
+        batch1 = [
+            self._row("2026/04/22", "23:59:57", "RUN", 50),
+            self._row("2026/04/22", "23:59:58", "RUN", 51),
+            self._row("2026/04/22", "23:59:59", "RUN", 52),
+            self._row("2026/04/23", "00:00:00", "RUN", 53),
+            self._row("2026/04/23", "00:00:01", "RUN", 54),
+            self._row("2026/04/23", "00:00:02", "RUN", 55),
+            self._row("2026/04/23", "00:00:03", "RUN", 56),
+            self._row("2026/04/23", "00:00:04", "RUN", 57),
+            self._row("2026/04/23", "00:00:30", "RUN", 83),  # peek-ahead
+        ]
+        self._write(batch1)
+        parse_log_file(self.db_path, "M13", self.log_path, "23")
+
+        # Snapshot 22's hour-23 after batch 1 (cross-midnight rows were
+        # legitimately attributed to 22 via UPSERT += in the normal
+        # incremental path). This is the value the replay must NOT disturb.
+        with sqlite3.connect(self.db_path) as conn:
+            prior_after_b1 = conn.execute(
+                "SELECT run_seconds, reset_seconds, stop_seconds, "
+                "total_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-22' AND hour=23"
+            ).fetchone()
+        self.assertIsNotNone(prior_after_b1, "Batch 1 should leave 22 hour 23 intact")
+        self.assertGreaterEqual(prior_after_b1[0], 3500,
+                                "Sanity: 22 hour 23 RUN should be at least seed value")
+
+        # Batch 2: append fill-in rows earlier than the peek-ahead → replay.
+        batch2 = batch1 + [
+            self._row("2026/04/23", "00:00:05", "RUN", 58),
+            self._row("2026/04/23", "00:00:06", "RUN", 59),
+            self._row("2026/04/23", "00:00:07", "RUN", 60),
+            self._row("2026/04/23", "00:00:08", "RUN", 61),
+            self._row("2026/04/23", "00:00:31", "RUN", 84),
+        ]
+        self._write(batch2)
+        parse_log_file(self.db_path, "M13", self.log_path, "23")
+
+        with sqlite3.connect(self.db_path) as conn:
+            prior_after_b2 = conn.execute(
+                "SELECT run_seconds, reset_seconds, stop_seconds, "
+                "total_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-22' AND hour=23"
+            ).fetchone()
+            today_hour0 = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-23' AND hour=0"
+            ).fetchone()
+
+        # The replay-driven full re-parse of 23Drive.Log must NOT touch 22's
+        # hourly row (which is owned by 22Drive.Log's parse). Without the
+        # fix, the DELETE step wiped all dates in parsed_rows → 22's 3500+
+        # seed would be destroyed and only the 3 cross-midnight seconds
+        # would remain.
+        self.assertIsNotNone(prior_after_b2, "Prior day (22) hour-23 row must still exist")
+        self.assertEqual(prior_after_b2, prior_after_b1,
+                         "Replay must not modify prior-day hourly row "
+                         "(before={}, after={})".format(prior_after_b1, prior_after_b2))
+
+        # Today's hour-0 data should match single-pass oracle on same file.
+        oracle_db = os.path.join(self.temp_dir, "oracle.db")
+        init_database(oracle_db)
+        parse_log_file(oracle_db, "M13", self.log_path, "23")
+        with sqlite3.connect(oracle_db) as conn:
+            oracle = conn.execute(
+                "SELECT run_seconds, hole_count FROM hourly_utilization "
+                "WHERE machine_id='M13' AND date='2026-04-23' AND hour=0"
+            ).fetchone()
+
+        self.assertIsNotNone(today_hour0, "Today's hour-0 row must exist")
+        self.assertEqual(today_hour0[0], oracle[0],
+                         "Today RUN after replay should match oracle "
+                         "(got {}, oracle {})".format(today_hour0[0], oracle[0]))
+        self.assertEqual(today_hour0[1], oracle[1],
+                         "Today hole_count after replay should match oracle "
+                         "(got {}, oracle {})".format(today_hour0[1], oracle[1]))
+
+
 class TestParserWithFixture(unittest.TestCase):
     """Test parser accuracy using real fixture file (if available)."""
 
@@ -483,6 +858,118 @@ class TestParserWithFixture(unittest.TestCase):
 
         self.assertEqual(count, GOLDEN_TRANSITION_COUNT,
                          "Transition count: got {} expected {}".format(count, GOLDEN_TRANSITION_COUNT))
+
+
+class TestExtractWorkOrderVariants(unittest.TestCase):
+    """WO_PATTERN must accept the '-N' variant suffix some operators add when
+    reissuing the same work order (e.g. 'O2603035-2.B'). M14/M18 incident
+    on 2026-04-28: the regex rejected the '-2' form, TX1 parser silently
+    skipped the LOAD event, and machine_current_state.work_order stayed
+    anchored on the previous match for ~20h."""
+
+    def test_variant_suffix_accepted(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(
+            extract_work_order("O2603035-2.B"),
+            ("O2603035-2", "B"),
+            "hyphen-N variant must be carried into work_order so distinct "
+            "reissues remain distinguishable on the dashboard",
+        )
+
+    def test_canonical_forms_unchanged(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(extract_work_order("O2604016.B"), ("O2604016", "B"))
+        self.assertEqual(extract_work_order("GR2604003.T"), ("GR2604003", "T"))
+        # Trailing digit after side (existing format from B1/T1 fixtures).
+        self.assertEqual(extract_work_order("O2604055.B1"), ("O2604055", "B"))
+
+    def test_non_wo_rejected(self):
+        from parsers.drive_log_parser import extract_work_order
+        self.assertEqual(extract_work_order("O100.txt"), (None, None))
+        self.assertEqual(extract_work_order("LASER-URA.T"), (None, None))
+        self.assertEqual(extract_work_order(""), (None, None))
+
+
+class TestComputeEffectiveSince(unittest.TestCase):
+    """Effective since must collapse <=60s same-state flickers (operator
+    pause/resume transients).
+
+    Reproduces the M14 trace from 2026-04-28: machine ran continuously for
+    ~18h with three brief STOP transients (4s, 26s, 16s) and one cluster of
+    rapid RUN/RESET/STOP toggles during setup. db_since pointed at the most
+    recent RUN entry (~13min ago in the snapshot), but the dashboard should
+    show the start of the continuous run (>18h ago)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_database(self.db_path)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _add(self, ts, frm, to):
+        self.conn.execute(
+            "INSERT INTO state_transitions "
+            "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+            "VALUES ('M14', ?, ?, ?, 'O100.txt', '000', 0.0)",
+            (ts, frm, to),
+        )
+
+    def test_collapses_short_stop_flickers(self):
+        from server.api_server import compute_effective_since
+        # Continuous RUN started 16:00:00, with two brief STOP flickers later.
+        self._add("2026-04-27T16:00:00", "STOP", "RUN")
+        self._add("2026-04-27T18:00:00", "RUN", "STOP")
+        self._add("2026-04-27T18:00:30", "STOP", "RUN")  # 30s gap — flicker
+        self._add("2026-04-28T08:00:00", "RUN", "STOP")
+        self._add("2026-04-28T08:00:15", "STOP", "RUN")  # 15s gap — flicker
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-28T08:00:15")
+        self.assertEqual(eff, "2026-04-27T16:00:00",
+                         "must walk back through both 30s and 15s STOP "
+                         "flickers and anchor on the original RUN entry")
+
+    def test_stops_on_long_gap(self):
+        from server.api_server import compute_effective_since
+        self._add("2026-04-27T08:00:00", "STOP", "RUN")
+        self._add("2026-04-27T18:00:00", "RUN", "STOP")
+        # 5-minute STOP — too long, must NOT be collapsed.
+        self._add("2026-04-27T18:05:00", "STOP", "RUN")
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-27T18:05:00")
+        self.assertEqual(eff, "2026-04-27T18:05:00",
+                         "5-minute gap exceeds flicker threshold; effective "
+                         "since must stay on the latest RUN entry")
+
+    def test_collapses_multi_hop_flicker(self):
+        from server.api_server import compute_effective_since
+        # M18-shaped pattern: RUN -> STOP -> RESET -> STOP -> RUN within 60s.
+        # The walk-back must find the RUN exit (not the immediately-prior
+        # transition) and measure the full RUN-to-RUN gap.
+        self._add("2026-04-27T16:00:00", "STOP", "RUN")
+        self._add("2026-04-27T17:00:00", "RUN", "STOP")
+        self._add("2026-04-27T17:00:24", "STOP", "RESET")
+        self._add("2026-04-27T17:00:36", "RESET", "STOP")
+        self._add("2026-04-27T17:00:37", "STOP", "RUN")
+        self.conn.commit()
+
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-27T17:00:37")
+        self.assertEqual(eff, "2026-04-27T16:00:00",
+                         "RUN-to-RUN gap was 37s through STOP/RESET/STOP — "
+                         "must collapse and walk back to the earlier RUN")
+
+    def test_falls_back_to_db_since_when_no_transitions(self):
+        from server.api_server import compute_effective_since
+        eff = compute_effective_since(self.conn, "M14", "RUN", "2026-04-28T10:00:00")
+        self.assertEqual(eff, "2026-04-28T10:00:00",
+                         "fresh DB with no transitions must return db_since")
 
 
 if __name__ == "__main__":
