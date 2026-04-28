@@ -117,16 +117,28 @@ def collect_program_info(machine, machines_config, settings):
     Source: \\{ip}\{laser_info_path}\
     Dest: backup_root/{machine_id}/programs/
 
+    If the machine config has skip_info=true (e.g. L1, where the vendor
+    has not yet created C:\\LaserDrillingProcess\\Info on the control PC),
+    skip the INFO share entirely and return True. The machine then runs
+    with only utilization/state data — no work_order, no per-WO hole_count.
+
     Args:
         machine: Machine config dict.
         machines_config: Full machines config.
         settings: Settings dict.
 
     Returns:
-        bool: True if succeeded.
+        bool: True if succeeded (or skipped).
     """
     machine_id = machine["id"]
     ip = machine["ip"]
+
+    if machine.get("skip_info"):
+        logger.debug(
+            "[%s] skip_info=true; INFO share collection skipped", machine_id
+        )
+        return True
+
     today = datetime.date.today()
 
     laser_info_path = machines_config.get("laser_info_path", r"D$\LaserDrillingProcess\Info")

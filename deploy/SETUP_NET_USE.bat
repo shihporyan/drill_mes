@@ -26,7 +26,8 @@ echo [Step 1] Removing stale mappings (ignore errors)...
 for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     net use \\10.10.1.%%i /delete >nul 2>&1
 )
-REM Laser machines (L2-L4: .32-.34); L1 (.31) folder pending vendor confirmation
+REM Laser machines (L1-L4: .31-.34). L1 only has LOG share (no INFO yet).
+net use \\10.10.1.31\LOG /delete >nul 2>&1
 for %%i in (32 33 34) do (
     net use \\10.10.1.%%i\LOG /delete >nul 2>&1
     net use \\10.10.1.%%i\INFO /delete >nul 2>&1
@@ -45,7 +46,15 @@ for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     )
 )
 
-REM --- 3 Kataoka laser machines (L2-L4), Guest auth ---
+REM --- L1 (LOG only — INFO share not yet created on the control PC,
+REM     handled by skip_info=true in machines.json) ---
+echo   Mapping \\10.10.1.31\LOG ...
+net use \\10.10.1.31\LOG "" /user:Guest /persistent:yes
+if errorlevel 1 (
+    echo     WARNING: failed to map \\10.10.1.31\LOG
+)
+
+REM --- L2-L4 (LOG + INFO), Guest auth ---
 for %%i in (32 33 34) do (
     echo   Mapping \\10.10.1.%%i\LOG ...
     net use \\10.10.1.%%i\LOG "" /user:Guest /persistent:yes
