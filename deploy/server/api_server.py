@@ -187,6 +187,13 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
             self._serve_static(static_path)
             return
 
+        # Browser DevTools auto-fetches *.map source maps for minified JS.
+        # We don't ship them — quiet 204 keeps the access log clean.
+        if path.endswith(".map"):
+            self.send_response(204)
+            self.end_headers()
+            return
+
         self._send_error(404, "Not found")
 
     def _serve_static(self, file_path):
