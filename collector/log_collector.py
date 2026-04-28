@@ -25,7 +25,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from parsers.base_parser import (
     load_machines_config,
     load_settings,
-    get_enabled_machines,
+    get_machines_by_type,
     get_backup_root,
     get_db_connection,
     get_db_path,
@@ -208,12 +208,12 @@ def run_collection_cycle(settings=None, machines_config=None, db_path=None):
     if db_path is None:
         db_path = get_db_path(settings)
 
-    enabled = get_enabled_machines(machines_config)
+    enabled = get_machines_by_type(machines_config, "takeuchi")
     if not enabled:
-        logger.warning("No enabled machines found in config.")
+        logger.warning("No enabled Takeuchi machines found in config.")
         return
 
-    logger.info("Collection cycle: %d enabled machines", len(enabled))
+    logger.info("Collection cycle: %d enabled Takeuchi machines", len(enabled))
 
     for machine in enabled:
         if should_skip_backoff(db_path, machine["id"], settings):

@@ -19,18 +19,18 @@
     {"id": "M17", "ip": "10.10.1.27", "type": "takeuchi", "enabled": true},
     {"id": "M18", "ip": "10.10.1.28", "type": "takeuchi", "enabled": true},
 
-    {"id": "L1", "ip": "10.10.2.11", "type": "kataoka", "enabled": false},
-    {"id": "L2", "ip": "10.10.2.12", "type": "kataoka", "enabled": false},
-    {"id": "L3", "ip": "10.10.2.13", "type": "kataoka", "enabled": false},
-    {"id": "L4", "ip": "10.10.2.14", "type": "kataoka", "enabled": false}
+    {"id": "L1", "ip": "10.10.1.31", "type": "kataoka", "enabled": false},
+    {"id": "L2", "ip": "10.10.1.32", "type": "kataoka", "enabled": true},
+    {"id": "L3", "ip": "10.10.1.33", "type": "kataoka", "enabled": false},
+    {"id": "L4", "ip": "10.10.1.34", "type": "kataoka", "enabled": false}
   ],
   "log_share_name": "LOG",
   "smb_user": "Takeuchi",
   "smb_password": "",
 
-  "laser_log_path": "D$\\LaserDrillingProcess\\Log",
-  "laser_info_path": "D$\\LaserDrillingProcess\\Info",
-  "laser_desktop_path": "C$\\Users\\KATAOKA\\Desktop",
-  "laser_smb_user": "KATAOKA",
+  "laser_log_path": "LOG",
+  "laser_info_path": "INFO",
+  "laser_desktop_path": "",
+  "laser_smb_user": "Guest",
   "laser_smb_password": ""
 }

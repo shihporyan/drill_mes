@@ -23,6 +23,11 @@ REM  re-issuing here is a belt-and-suspenders defense.
 for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     net use \\10.10.1.%%i\LOG "" /user:Takeuchi /persistent:yes >nul 2>&1
 )
+REM --- Kataoka laser machines (L2-L4); L1 (.31) pending vendor ---
+for %%i in (32 33 34) do (
+    net use \\10.10.1.%%i\LOG "" /user:Guest /persistent:yes >nul 2>&1
+    net use \\10.10.1.%%i\INFO "" /user:Guest /persistent:yes >nul 2>&1
+)
 
 REM --- Small settle before robocopy fires its first cycle ---
 timeout /t 5 /nobreak >nul

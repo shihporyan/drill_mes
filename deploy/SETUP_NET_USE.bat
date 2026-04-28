@@ -26,6 +26,11 @@ echo [Step 1] Removing stale mappings (ignore errors)...
 for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     net use \\10.10.1.%%i /delete >nul 2>&1
 )
+REM Laser machines (L2-L4: .32-.34); L1 (.31) folder pending vendor confirmation
+for %%i in (32 33 34) do (
+    net use \\10.10.1.%%i\LOG /delete >nul 2>&1
+    net use \\10.10.1.%%i\INFO /delete >nul 2>&1
+)
 
 echo.
 echo [Step 2] Creating persistent mappings...
@@ -37,6 +42,20 @@ for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     net use \\10.10.1.%%i\LOG "" /user:Takeuchi /persistent:yes
     if errorlevel 1 (
         echo     WARNING: failed to map \\10.10.1.%%i\LOG
+    )
+)
+
+REM --- 3 Kataoka laser machines (L2-L4), Guest auth ---
+for %%i in (32 33 34) do (
+    echo   Mapping \\10.10.1.%%i\LOG ...
+    net use \\10.10.1.%%i\LOG "" /user:Guest /persistent:yes
+    if errorlevel 1 (
+        echo     WARNING: failed to map \\10.10.1.%%i\LOG
+    )
+    echo   Mapping \\10.10.1.%%i\INFO ...
+    net use \\10.10.1.%%i\INFO "" /user:Guest /persistent:yes
+    if errorlevel 1 (
+        echo     WARNING: failed to map \\10.10.1.%%i\INFO
     )
 )
 

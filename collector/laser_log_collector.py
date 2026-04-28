@@ -163,7 +163,12 @@ def collect_lsr_files(machine, machines_config, settings):
     machine_id = machine["id"]
     ip = machine["ip"]
 
-    laser_desktop_path = machines_config.get("laser_desktop_path", r"C$\Users\KATAOKA\Desktop")
+    laser_desktop_path = machines_config.get("laser_desktop_path", "")
+    if not laser_desktop_path:
+        # Desktop share not opened on the laser PC — skip LSR collection.
+        # Hole counts and board names will be unavailable until access is granted.
+        return True
+
     programs_dir = os.path.join(get_backup_root(settings), machine_id, "programs")
     lsr_dest = os.path.join(get_backup_root(settings), machine_id, "lsr_files")
 
