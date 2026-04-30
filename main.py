@@ -88,60 +88,66 @@ def run_collect_and_parse_loop(settings, machines_config, db_path):
     interval = settings.get("poll_interval_seconds", 600)
     logger.info("Collector+Parser loop started (interval=%ds)", interval)
 
+    steps = (
+        ("collect_takeuchi", lambda: run_collection_cycle(
+            settings=settings, machines_config=machines_config, db_path=db_path)),
+        ("collect_laser", lambda: run_laser_collection_cycle(
+            settings=settings, machines_config=machines_config, db_path=db_path)),
+        ("parse_drive", lambda: run_parser_cycle(
+            db_path=db_path, settings=settings, machines_config=machines_config)),
+        ("parse_tx1", lambda: run_tx1_parser_cycle(
+            db_path=db_path, settings=settings, machines_config=machines_config)),
+        ("parse_laser", lambda: run_laser_parser_cycle(
+            db_path=db_path, settings=settings, machines_config=machines_config)),
+        ("cleanup", lambda: cleanup_old_backups(dry_run=False, settings=settings)),
+    )
+
     while True:
-        try:
-            # Step 1: Collect logs from machines
-            logger.info("--- Collection cycle ---")
-            run_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
-        except Exception as e:
-            logger.error("Collection failed: %s", e, exc_info=True)
+        cycle_start = datetime.datetime.now()
+        steps_ok = 0
+        failed = []
 
-        try:
-            # Step 1b: Collect laser logs
-            logger.info("--- Laser collection cycle ---")
-            run_laser_collection_cycle(settings=settings, machines_config=machines_config, db_path=db_path)
-        except Exception as e:
-            logger.error("Laser collection failed: %s", e, exc_info=True)
+        for step_name, step_fn in steps:
+            logger.info("--- %s ---", step_name)
+            try:
+                step_fn()
+                steps_ok += 1
+            except Exception as e:
+                logger.error("%s failed: %s", step_name, e, exc_info=True)
+                failed.append(step_name)
 
-        try:
-            # Step 2: Parse collected logs (mechanical)
-            logger.info("--- Parser cycle ---")
-            run_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
-        except Exception as e:
-            logger.error("Parser failed: %s", e, exc_info=True)
+        cycle_end = datetime.datetime.now()
+        took_ms = int((cycle_end - cycle_start).total_seconds() * 1000)
 
-        try:
-            # Step 2a: Parse TX1.Log for work order tracking
-            logger.info("--- TX1 parser cycle ---")
-            run_tx1_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
-        except Exception as e:
-            logger.error("TX1 parser failed: %s", e, exc_info=True)
-
-        try:
-            # Step 2b: Parse collected logs (laser)
-            logger.info("--- Laser parser cycle ---")
-            run_laser_parser_cycle(db_path=db_path, settings=settings, machines_config=machines_config)
-        except Exception as e:
-            logger.error("Laser parser failed: %s", e, exc_info=True)
-
-        try:
-            # Step 3: Cleanup old backups (lightweight check)
-            cleanup_old_backups(dry_run=False, settings=settings)
-        except Exception as e:
-            logger.error("Cleanup failed: %s", e, exc_info=True)
-
-        # Write next_cycle_at so frontend can align its countdown
-        next_at = (datetime.datetime.now() + datetime.timedelta(seconds=interval)).isoformat()
+        # Write next_cycle_at + cycle_stats together so the dashboard has
+        # both the countdown target and a row to chart.
+        next_at = (cycle_end + datetime.timedelta(seconds=interval)).isoformat()
         try:
             with sqlite3.connect(db_path) as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO system_status(key, value) VALUES(?, ?)",
                     ("next_cycle_at", next_at),
                 )
+                conn.execute(
+                    "INSERT INTO cycle_stats "
+                    "(cycle_start, cycle_end, took_ms, interval_secs, "
+                    "steps_ok, steps_failed, failed_step_names) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (cycle_start.isoformat(), cycle_end.isoformat(), took_ms,
+                     interval, steps_ok, len(failed),
+                     ",".join(failed) if failed else None),
+                )
         except Exception as e:
-            logger.warning("Failed to write next_cycle_at: %s", e)
+            logger.warning("Failed to write cycle status: %s", e)
 
-        logger.info("Next cycle in %d seconds...", interval)
+        if took_ms > interval * 1000:
+            logger.warning(
+                "Cycle took %dms, longer than poll_interval %ds. "
+                "Next cycle starts immediately (no idle time).",
+                took_ms, interval,
+            )
+
+        logger.info("Cycle done in %dms. Next cycle in %d seconds...", took_ms, interval)
         time.sleep(interval)
 
 

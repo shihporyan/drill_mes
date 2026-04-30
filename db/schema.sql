@@ -86,6 +86,20 @@ CREATE TABLE IF NOT EXISTS system_status (
     value TEXT
 );
 
+-- Per-cycle health: how long each collect+parse loop took and how many
+-- steps errored. Lets the dashboard show whether poll_interval is large
+-- enough for the work, without relying on terminal stdout that rotates.
+CREATE TABLE IF NOT EXISTS cycle_stats (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_start     TEXT NOT NULL,      -- ISO timestamp
+    cycle_end       TEXT NOT NULL,      -- ISO timestamp
+    took_ms         INTEGER NOT NULL,   -- end - start in milliseconds
+    interval_secs   INTEGER,            -- configured poll_interval at the time
+    steps_ok        INTEGER DEFAULT 0,  -- count of steps that completed
+    steps_failed    INTEGER DEFAULT 0,  -- count of steps that raised
+    failed_step_names TEXT              -- comma-separated names if any failed
+);
+
 -- ===== Flush Latency Instrumentation =====
 -- See notes/tx1_flush_latency_investigation.md
 
@@ -139,3 +153,4 @@ CREATE INDEX IF NOT EXISTS idx_laser_wo_machine ON laser_work_orders(machine_id,
 CREATE INDEX IF NOT EXISTS idx_tx1_latency_machine ON tx1_event_latency(machine_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_log_observe_machine ON log_file_observe(machine_id, log_type, observed_at);
 CREATE INDEX IF NOT EXISTS idx_tx1_mtime_machine ON tx1_mtime_events(machine_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_cycle_stats_start ON cycle_stats(cycle_start);
