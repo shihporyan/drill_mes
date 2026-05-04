@@ -15,8 +15,8 @@ Output layout (on USB):
         app_log/
             drill_monitor.log            (live + rotated backups)
         M01/                             (Takeuchi: today + yesterday)
-            27Drive.Log / 27TX1.Log
-            28Drive.Log / 28TX1.Log
+            27Drive.Log / 27TX1.Log / 27FILE.Log
+            28Drive.Log / 28TX1.Log / 28FILE.Log
         ...
         L1/                              (Kataoka: today + yesterday)
             20260427/20260427_ClsPLCTrd.log
@@ -110,7 +110,7 @@ def copy_takeuchi_logs(backup_root, machines, out_dir, manifest):
     manifest.append("Today day_prefix: {}  Yesterday: {}".format(dd_today, dd_yesterday))
     manifest.append("Today date dir: {}  Yesterday: {}".format(today_dir, yesterday_dir))
     manifest.append("")
-    manifest.append("=== Takeuchi Drive.Log + TX1.Log ===")
+    manifest.append("=== Takeuchi Drive.Log + TX1.Log + FILE.Log ===")
 
     copied = 0
     missing = []
@@ -126,7 +126,7 @@ def copy_takeuchi_logs(backup_root, machines, out_dir, manifest):
             if not os.path.isdir(src_dir):
                 missing.append("{}: no folder {}".format(mid, src_dir))
                 continue
-            for fname in ("{}Drive.Log".format(dd), "{}TX1.Log".format(dd)):
+            for fname in ("{}Drive.Log".format(dd), "{}TX1.Log".format(dd), "{}FILE.Log".format(dd)):
                 src = os.path.join(src_dir, fname)
                 if os.path.isfile(src):
                     if not any_copied:

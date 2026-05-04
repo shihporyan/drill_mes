@@ -59,6 +59,7 @@ npm run test:e2e:ui
 
 目前筆記：
 - [notes/laser_board_identification.md](notes/laser_board_identification.md) — 雷鑽 `.lsr` 宣告夾帶板名的可行性
+- [notes/mech_drill_board_identification.md](notes/mech_drill_board_identification.md) — 機鑽子板別 (A/B/C/D/E/F/G) 識別調查（**5/3 突破**：O100.txt 內 O100 段的 M98P### 列表 = 當前板別；TX1 LoadProgram 事件當 trigger；M14 FILE.Log dump 全文，M13 需讀 live SMB；parser + dev tool 已完成）
 - [notes/work_detail_fields_investigation.md](notes/work_detail_fields_investigation.md) — 作業細節欄位調查（已完成）
 - [notes/work_detail_fields_plan.md](notes/work_detail_fields_plan.md) — 作業細節欄位規劃（機械鑽孔，討論中）
 - [notes/m13_firmware_gap_investigation.md](notes/m13_firmware_gap_investigation.md) — M13 Drive.Log 時間跳躍/倒退現象

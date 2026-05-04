@@ -1,0 +1,7 @@
+machine,ip,nc_dir_path,dir_accessible,dir_entry_count,o100_exists,o100_size,o100_mtime,o100_hash,active_subs,error
+M13,10.10.1.23,\\10.10.1.23\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.23\\LOG\\Takeuchi\\NcProgram'
+M14,10.10.1.24,\\10.10.1.24\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.24\\LOG\\Takeuchi\\NcProgram'
+M15,10.10.1.25,\\10.10.1.25\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.25\\LOG\\Takeuchi\\NcProgram'
+M16,10.10.1.26,\\10.10.1.26\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.26\\LOG\\Takeuchi\\NcProgram'
+M17,10.10.1.27,\\10.10.1.27\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.27\\LOG\\Takeuchi\\NcProgram'
+M18,10.10.1.28,\\10.10.1.28\LOG\Takeuchi\NcProgram,False,,False,,,,,listdir: [Errno 2] No such file or directory: '\\\\10.10.1.28\\LOG\\Takeuchi\\NcProgram'
