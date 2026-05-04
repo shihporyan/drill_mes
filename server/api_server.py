@@ -43,7 +43,7 @@ SINCE_FLICKER_SECONDS = 60
 # testing) and creates visual noise in trend / month views. All trend, heatmap,
 # and utilization queries filter on date >= this value. If the production
 # baseline shifts (e.g. another fresh cutover), update this constant.
-DATA_START_DATE = "2026-04-01"
+DATA_START_DATE = "2026-04-21"
 
 
 def _bool_param(params, key, default):
@@ -608,9 +608,13 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                         entry["holes"] = None
                     data.append(entry)
 
-                # Compute period stats from months that have data
+                # Period summary uses fleet weighted-average (sum run / sum total),
+                # not simple-mean of monthly buckets — otherwise an early month
+                # with only a few seconds of data weighs the same as a full month.
                 with_data = [d for d in data if d["util"] is not None]
-                avg_util = round(sum(d["util"] for d in with_data) / len(with_data), 1) if with_data else 0
+                total_run = sum((r["run"] or 0) for r in rows)
+                total_secs = sum((r["total"] or 0) for r in rows)
+                avg_util = round(total_run / total_secs * 100, 1) if total_secs > 0 else 0
                 if filtered_machine_ids is not None:
                     machine_count = len(filtered_machine_ids)
                 else:
@@ -695,8 +699,12 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                         "isCurrent": ws == current_week_start,
                     })
 
+                # See year-level comment: weighted average across the rows so
+                # an incomplete week doesn't get equal weight as a full one.
                 with_data = [d for d in data if d["util"] is not None]
-                avg_util = round(sum(d["util"] for d in with_data) / len(with_data), 1) if with_data else 0
+                total_run = sum((r["run"] or 0) for r in rows)
+                total_secs = sum((r["total"] or 0) for r in rows)
+                avg_util = round(total_run / total_secs * 100, 1) if total_secs > 0 else 0
 
                 machine_count = len(filtered_machine_ids) if filtered_machine_ids is not None else None
                 self._send_json({
@@ -761,8 +769,12 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                         "isCurrent": d == now,
                     })
 
+                # See year-level comment: weighted average across the rows so
+                # a partial day doesn't get equal weight as a full one.
                 with_data = [d for d in data if d["util"] is not None]
-                avg_util = round(sum(d["util"] for d in with_data) / len(with_data), 1) if with_data else 0
+                total_run = sum((r["run"] or 0) for r in rows)
+                total_secs = sum((r["total"] or 0) for r in rows)
+                avg_util = round(total_run / total_secs * 100, 1) if total_secs > 0 else 0
 
                 machine_count = len(filtered_machine_ids) if filtered_machine_ids is not None else None
                 self._send_json({
