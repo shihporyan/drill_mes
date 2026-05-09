@@ -5,28 +5,54 @@ hourly_utilization, work-order assignment, and laser shift averages can
 all be cross-verified against raw logs on the dev machine.
 
 Usage:
-    python tools/usb_sample.py              # Auto-detect USB drive
-    python tools/usb_sample.py D:           # Explicit drive letter
-    python tools/usb_sample.py D:\\subdir   # Explicit target path
+    python tools/usb_sample.py                    # Auto-detect USB, default 2-day window
+    python tools/usb_sample.py D:                 # Explicit drive letter
+    python tools/usb_sample.py D:\\subdir         # Explicit target path
+    python tools/usb_sample.py --audit            # Wide window for full audit
+    python tools/usb_sample.py D: --audit         # Both
+
+Window control:
+    Default               Drive=2d, TX1=2d, FILE=2d, Kataoka=2d  (~50 MB)
+    --audit               Drive=2d, TX1=8d, FILE=8d, Kataoka=2d  (~500 MB-1 GB)
+    --tx1-days N          Override TX1 window
+    --file-days N         Override FILE window
+    --drive-days N        Override Drive window
+    --kataoka-days N      Override Kataoka ClsPLCTrd window
+
+Always-on extras (small, free):
+    extras/schema.sql           CREATE statements from sqlite_master
+    extras/cycle_stats.csv      Last 30 days of parser cycle health
+    extras/sha256_manifest.txt  SHA256 of every copied raw log
 
 Output layout (on USB):
     drill_sample_YYYYMMDD_HHMMSS/
         drill_monitor_snapshot.db        (hot-copied via sqlite3 .backup)
+        extras/
+            schema.sql
+            cycle_stats.csv
+            sha256_manifest.txt
         app_log/
             drill_monitor.log            (live + rotated backups)
-        M01/                             (Takeuchi: today + yesterday)
-            27Drive.Log / 27TX1.Log / 27FILE.Log
-            28Drive.Log / 28TX1.Log / 28FILE.Log
-        ...
-        L1/                              (Kataoka: today + yesterday)
-            20260427/20260427_ClsPLCTrd.log
-            20260428/20260428_ClsPLCTrd.log
+        M01/
+            20260508/                    (date subfolder, matches SMB layout)
+                08Drive.Log
+                08TX1.Log
+                08FILE.Log
+            20260507/
+                07TX1.Log                (TX1+FILE only when --audit goes back further than Drive)
+                07FILE.Log
+            ...
+        L1/
+            20260508/20260508_ClsPLCTrd.log
             programs/                    (ProcTimeStart.txt, ProcTimeEnd.txt, ...)
         ...
         MANIFEST.txt                     (summary)
 """
 
+import argparse
+import csv
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -38,7 +64,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_settings():
+    """Load settings, honoring DRILL_DEV_CONFIG override (matches base_parser)."""
     path = os.path.join(PROJECT_ROOT, "config", "settings.json")
+    env_override = os.environ.get("DRILL_DEV_CONFIG")
+    if env_override:
+        override_path = env_override if os.path.isabs(env_override) else os.path.join(PROJECT_ROOT, env_override)
+        if os.path.exists(override_path):
+            path = override_path
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -98,17 +130,51 @@ def resolve_target(arg):
     return out_dir
 
 
-def copy_takeuchi_logs(backup_root, machines, out_dir, manifest):
-    """Copy Drive.Log + TX1.Log for today + yesterday for each Takeuchi machine."""
-    today = datetime.date.today()
-    yesterday = today - datetime.timedelta(days=1)
-    today_dir = today.strftime("%Y%m%d")
-    yesterday_dir = yesterday.strftime("%Y%m%d")
-    dd_today = today.strftime("%d")
-    dd_yesterday = yesterday.strftime("%d")
+def compute_sha256(path):
+    """Stream-read SHA256 for any file size."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    manifest.append("Today day_prefix: {}  Yesterday: {}".format(dd_today, dd_yesterday))
-    manifest.append("Today date dir: {}  Yesterday: {}".format(today_dir, yesterday_dir))
+
+def _record_copied(dst, out_dir, hashes, manifest_lines, label):
+    """Hash dst, append to hashes list and manifest lines. Returns size_bytes."""
+    sha = compute_sha256(dst)
+    rel = os.path.relpath(dst, out_dir).replace("\\", "/")
+    hashes.append((rel, sha))
+    size = os.path.getsize(dst)
+    if size >= 1024 * 1024:
+        size_str = "{:.1f} MB".format(size / (1024 * 1024))
+    else:
+        size_str = "{} KB".format(size // 1024)
+    manifest_lines.append("  {} ({}, sha256={}...)".format(label, size_str, sha[:12]))
+    return size
+
+
+def copy_takeuchi_logs(backup_root, machines, out_dir, manifest, hashes,
+                       drive_days, tx1_days, file_days):
+    """Copy Drive.Log + TX1.Log + FILE.Log per Takeuchi machine.
+
+    Each file type has its own day window, useful for audits where TX1 / FILE
+    need a wider history (LoadProgram events, O100.txt content) but Drive.Log
+    is bulky and only used for sample cross-check.
+
+    Output layout: {out_dir}/{machine_id}/{YYYYMMDD}/{DD}{suffix}
+    """
+    today = datetime.date.today()
+    fname_specs = [
+        ("Drive.Log", drive_days),
+        ("TX1.Log", tx1_days),
+        ("FILE.Log", file_days),
+    ]
+    max_days = max(drive_days, tx1_days, file_days)
+    min_days = min(drive_days, tx1_days, file_days)
+
+    manifest.append(
+        "Today: {}  windows: drive={}d tx1={}d file={}d".format(
+            today.strftime("%Y%m%d"), drive_days, tx1_days, file_days))
     manifest.append("")
     manifest.append("=== Takeuchi Drive.Log + TX1.Log + FILE.Log ===")
 
@@ -118,51 +184,60 @@ def copy_takeuchi_logs(backup_root, machines, out_dir, manifest):
         if m.get("type") != "takeuchi":
             continue
         mid = m["id"]
-        dst_machine = os.path.join(out_dir, mid)
         any_copied = False
 
-        for date_dir, dd in ((today_dir, dd_today), (yesterday_dir, dd_yesterday)):
-            src_dir = os.path.join(backup_root, mid, date_dir)
-            if not os.path.isdir(src_dir):
-                missing.append("{}: no folder {}".format(mid, src_dir))
+        for i in range(max_days):
+            d = today - datetime.timedelta(days=i)
+            date_dir = d.strftime("%Y%m%d")
+            dd = d.strftime("%d")
+            src_date_dir = os.path.join(backup_root, mid, date_dir)
+
+            if not os.path.isdir(src_date_dir):
+                if i < min_days:
+                    missing.append("{}: no folder {}".format(mid, src_date_dir))
                 continue
-            for fname in ("{}Drive.Log".format(dd), "{}TX1.Log".format(dd), "{}FILE.Log".format(dd)):
-                src = os.path.join(src_dir, fname)
+
+            dst_date_dir = os.path.join(out_dir, mid, date_dir)
+            for suffix, days in fname_specs:
+                if i >= days:
+                    continue
+                fname = "{}{}".format(dd, suffix)
+                src = os.path.join(src_date_dir, fname)
                 if os.path.isfile(src):
                     if not any_copied:
-                        os.makedirs(dst_machine, exist_ok=True)
                         any_copied = True
-                    dst = os.path.join(dst_machine, fname)
+                    os.makedirs(dst_date_dir, exist_ok=True)
+                    dst = os.path.join(dst_date_dir, fname)
                     shutil.copy2(src, dst)
-                    size_kb = os.path.getsize(dst) // 1024
-                    manifest.append("  {}/{} ({} KB)".format(mid, fname, size_kb))
+                    _record_copied(dst, out_dir, hashes, manifest,
+                                   "{}/{}/{}".format(mid, date_dir, fname))
                     copied += 1
-                else:
-                    manifest.append("  {}/{} MISSING".format(mid, fname))
+                elif i < days:
+                    manifest.append("  {}/{}/{} MISSING".format(mid, date_dir, fname))
         print("  {}: done".format(mid))
 
     return copied, missing
 
 
-def copy_kataoka_logs(backup_root, machines, out_dir, manifest):
-    """Copy ClsPLCTrd daily logs + programs/ dir for each Kataoka laser."""
+def copy_kataoka_logs(backup_root, machines, out_dir, manifest, hashes,
+                      kataoka_days):
+    """Copy ClsPLCTrd daily logs + programs/ dir per Kataoka laser."""
     today = datetime.date.today()
-    yesterday = today - datetime.timedelta(days=1)
-    today_str = today.strftime("%Y%m%d")
-    yesterday_str = yesterday.strftime("%Y%m%d")
 
     manifest.append("")
     manifest.append("=== Kataoka ClsPLCTrd + programs/ ===")
+    manifest.append("Window: {}d".format(kataoka_days))
 
     copied = 0
     for m in machines:
         if m.get("type") != "kataoka":
             continue
         mid = m["id"]
-        dst_machine = os.path.join(out_dir, mid)
         any_copied = False
 
-        for date_str in (today_str, yesterday_str):
+        for i in range(kataoka_days):
+            d = today - datetime.timedelta(days=i)
+            date_str = d.strftime("%Y%m%d")
             src_dir = os.path.join(backup_root, mid, date_str)
             if not os.path.isdir(src_dir):
                 manifest.append("  {}/{} MISSING (no folder)".format(mid, date_str))
@@ -170,15 +245,13 @@ def copy_kataoka_logs(backup_root, machines, out_dir, manifest):
             fname = "{}_ClsPLCTrd.log".format(date_str)
             src = os.path.join(src_dir, fname)
             if os.path.isfile(src):
-                if not any_copied:
-                    os.makedirs(dst_machine, exist_ok=True)
-                    any_copied = True
-                dst_subdir = os.path.join(dst_machine, date_str)
+                any_copied = True
+                dst_subdir = os.path.join(out_dir, mid, date_str)
                 os.makedirs(dst_subdir, exist_ok=True)
                 dst = os.path.join(dst_subdir, fname)
                 shutil.copy2(src, dst)
-                size_mb = os.path.getsize(dst) / (1024 * 1024)
-                manifest.append("  {}/{}/{} ({:.1f} MB)".format(mid, date_str, fname, size_mb))
+                _record_copied(dst, out_dir, hashes, manifest,
+                               "{}/{}/{}".format(mid, date_str, fname))
                 copied += 1
             else:
                 manifest.append("  {}/{}/{} MISSING".format(mid, date_str, fname))
@@ -187,24 +260,31 @@ def copy_kataoka_logs(backup_root, machines, out_dir, manifest):
         # L1 currently has no INFO share so this dir won't exist.
         programs_src = os.path.join(backup_root, mid, "programs")
         if os.path.isdir(programs_src):
-            if not any_copied:
-                os.makedirs(dst_machine, exist_ok=True)
-                any_copied = True
-            programs_dst = os.path.join(dst_machine, "programs")
+            any_copied = True
+            programs_dst = os.path.join(out_dir, mid, "programs")
             try:
                 shutil.copytree(programs_src, programs_dst, dirs_exist_ok=True)
-                n_files = sum(len(files) for _, _, files in os.walk(programs_dst))
-                manifest.append("  {}/programs/ ({} files)".format(mid, n_files))
+                n_files = 0
+                for root, _, files in os.walk(programs_dst):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        _record_copied(full, out_dir, hashes, manifest,
+                                       os.path.relpath(full, out_dir).replace("\\", "/"))
+                        n_files += 1
+                manifest.append("  {}/programs/ ({} files total)".format(mid, n_files))
             except Exception as e:
                 manifest.append("  {}/programs/ FAILED: {}".format(mid, e))
         else:
             manifest.append("  {}/programs/ MISSING (skip_info?)".format(mid))
-        print("  {}: done".format(mid))
+        if any_copied:
+            print("  {}: done".format(mid))
+        else:
+            print("  {}: nothing to copy".format(mid))
 
     return copied
 
 
-def copy_app_log(out_dir, manifest):
+def copy_app_log(out_dir, manifest, hashes):
     """Copy drill_monitor.log + rotation backups (drill_monitor.log.1..5)."""
     manifest.append("")
     manifest.append("=== Application log ===")
@@ -220,8 +300,7 @@ def copy_app_log(out_dir, manifest):
             # avoids needing exclusive access that copy2 would request.
             with open(src, "rb") as fr, open(dst, "wb") as fw:
                 fw.write(fr.read())
-            size_kb = os.path.getsize(dst) // 1024
-            manifest.append("  app_log/{} ({} KB)".format(fname, size_kb))
+            _record_copied(dst, out_dir, hashes, manifest, "app_log/" + fname)
             copied += 1
         except Exception as e:
             manifest.append("  app_log/{} FAILED: {}".format(fname, e))
@@ -233,7 +312,7 @@ def snapshot_db(db_path, out_dir, manifest):
     if not os.path.isfile(db_path):
         print("WARN: DB not found at {}, skipping snapshot".format(db_path))
         manifest.append("DB snapshot: SKIPPED (source not found)")
-        return
+        return None
 
     dst = os.path.join(out_dir, "drill_monitor_snapshot.db")
     src_conn = sqlite3.connect(db_path)
@@ -247,12 +326,103 @@ def snapshot_db(db_path, out_dir, manifest):
     print("DB snapshot: {:.1f} MB".format(size_mb))
     manifest.append("")
     manifest.append("DB snapshot: {:.1f} MB".format(size_mb))
+    return dst
+
+
+def export_extras(snapshot_db_path, out_dir, manifest):
+    """Always-on small exports: schema.sql + cycle_stats.csv.
+
+    Run against the snapshot copy (not the live DB) to avoid holding any
+    locks on the production file beyond the .backup() call.
+    """
+    if not snapshot_db_path or not os.path.isfile(snapshot_db_path):
+        return
+
+    extras_dir = os.path.join(out_dir, "extras")
+    os.makedirs(extras_dir, exist_ok=True)
+    manifest.append("")
+    manifest.append("=== Extras ===")
+
+    conn = sqlite3.connect(snapshot_db_path)
+    try:
+        # schema.sql
+        schema_path = os.path.join(extras_dir, "schema.sql")
+        rows = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL ORDER BY type, name"
+        ).fetchall()
+        with open(schema_path, "w", encoding="utf-8") as f:
+            for t, n, s in rows:
+                f.write("-- {} {}\n{};\n\n".format(t, n, s))
+        manifest.append("  extras/schema.sql ({} objects)".format(len(rows)))
+
+        # cycle_stats.csv (last 30 days; small even when daily)
+        cs_path = os.path.join(extras_dir, "cycle_stats.csv")
+        try:
+            cur = conn.execute("""
+                SELECT cycle_start, cycle_end, took_ms, interval_secs,
+                       steps_ok, steps_failed, failed_step_names
+                FROM cycle_stats
+                WHERE cycle_start >= datetime('now', '-30 days')
+                ORDER BY cycle_start DESC
+            """)
+            rows = cur.fetchall()
+            with open(cs_path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["cycle_start", "cycle_end", "took_ms", "interval_secs",
+                            "steps_ok", "steps_failed", "failed_step_names"])
+                w.writerows(rows)
+            manifest.append("  extras/cycle_stats.csv ({} rows)".format(len(rows)))
+        except sqlite3.OperationalError as e:
+            manifest.append("  extras/cycle_stats.csv SKIPPED: {}".format(e))
+    finally:
+        conn.close()
+
+
+def write_sha256_manifest(out_dir, hashes):
+    """Dump (relpath, sha256) pairs into extras/sha256_manifest.txt."""
+    extras_dir = os.path.join(out_dir, "extras")
+    os.makedirs(extras_dir, exist_ok=True)
+    path = os.path.join(extras_dir, "sha256_manifest.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# SHA256 of every raw file copied (relative to drill_sample root)\n")
+        for rel, sha in sorted(hashes):
+            f.write("{}  {}\n".format(sha, rel))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="USB-bound drill-monitor sample collector",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("target", nargs="?",
+                   help="USB drive letter or path (auto-detect if omitted)")
+    p.add_argument("--audit", action="store_true",
+                   help="Wide window for full audit (TX1=8d, FILE=8d)")
+    p.add_argument("--drive-days", type=int, default=None)
+    p.add_argument("--tx1-days", type=int, default=None)
+    p.add_argument("--file-days", type=int, default=None)
+    p.add_argument("--kataoka-days", type=int, default=None)
+    return p.parse_args()
 
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    out_dir = resolve_target(arg)
+    args = parse_args()
+
+    if args.audit:
+        defaults = dict(drive=2, tx1=8, file=8, kataoka=2)
+    else:
+        defaults = dict(drive=2, tx1=2, file=2, kataoka=2)
+
+    drive_days = args.drive_days if args.drive_days is not None else defaults["drive"]
+    tx1_days = args.tx1_days if args.tx1_days is not None else defaults["tx1"]
+    file_days = args.file_days if args.file_days is not None else defaults["file"]
+    kataoka_days = args.kataoka_days if args.kataoka_days is not None else defaults["kataoka"]
+
+    out_dir = resolve_target(args.target)
     print("Output: {}".format(out_dir))
+    print("Windows: drive={}d tx1={}d file={}d kataoka={}d".format(
+        drive_days, tx1_days, file_days, kataoka_days))
 
     settings = load_settings()
     backup_root = settings.get("backup_root", "C:\\DrillLogs")
@@ -269,18 +439,24 @@ def main():
         "Drill Sample Manifest",
         "=====================",
         "Generated: {}".format(datetime.datetime.now().isoformat()),
+        "Mode: {}".format("AUDIT" if args.audit else "DEFAULT"),
         "Source backup_root: {}".format(backup_root),
         "Source DB: {}".format(db_path),
         "Machines: {} enabled (takeuchi={}, kataoka={})".format(
             len(machines), n_takeuchi, n_kataoka),
         "",
     ]
+    hashes = []
 
-    print("Copying Takeuchi Drive.Log + TX1.Log...")
-    n_takeuchi_files, missing = copy_takeuchi_logs(backup_root, machines, out_dir, manifest)
+    print("Copying Takeuchi Drive.Log + TX1.Log + FILE.Log...")
+    n_takeuchi_files, missing = copy_takeuchi_logs(
+        backup_root, machines, out_dir, manifest, hashes,
+        drive_days=drive_days, tx1_days=tx1_days, file_days=file_days)
 
     print("Copying Kataoka ClsPLCTrd + programs/...")
-    n_kataoka_files = copy_kataoka_logs(backup_root, machines, out_dir, manifest)
+    n_kataoka_files = copy_kataoka_logs(
+        backup_root, machines, out_dir, manifest, hashes,
+        kataoka_days=kataoka_days)
 
     if missing:
         manifest.append("")
@@ -288,10 +464,15 @@ def main():
         manifest.extend(missing)
 
     print("Copying app log...")
-    n_app_log = copy_app_log(out_dir, manifest)
+    n_app_log = copy_app_log(out_dir, manifest, hashes)
 
     print("Snapshotting DB...")
-    snapshot_db(db_path, out_dir, manifest)
+    snapshot_path = snapshot_db(db_path, out_dir, manifest)
+
+    print("Exporting schema + cycle_stats...")
+    export_extras(snapshot_path, out_dir, manifest)
+
+    write_sha256_manifest(out_dir, hashes)
 
     with open(os.path.join(out_dir, "MANIFEST.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(manifest) + "\n")
@@ -301,6 +482,7 @@ def main():
     print("  Takeuchi files: {}".format(n_takeuchi_files))
     print("  Kataoka files:  {}".format(n_kataoka_files))
     print("  App log files:  {}".format(n_app_log))
+    print("  SHA256 entries: {}".format(len(hashes)))
     if missing:
         print("  Missing Takeuchi folders: {}".format(len(missing)))
     print("Output: {}".format(out_dir))
