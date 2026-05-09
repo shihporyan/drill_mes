@@ -22,6 +22,8 @@ Window control:
 Always-on extras (small, free):
     extras/schema.sql           CREATE statements from sqlite_master
     extras/cycle_stats.csv      Last 30 days of parser cycle health
+    extras/machines.json        Per-machine config (IP, type, tx1_tz_offset_hours)
+    extras/o100_live_probe.csv  Live SMB read of each Takeuchi O100.txt at sample time
     extras/sha256_manifest.txt  SHA256 of every copied raw log
 
 Output layout (on USB):
@@ -30,9 +32,14 @@ Output layout (on USB):
         extras/
             schema.sql
             cycle_stats.csv
+            machines.json
+            o100_live_probe.csv
             sha256_manifest.txt
         app_log/
             drill_monitor.log            (live + rotated backups)
+        o100_live/
+            M01/O100.txt                 (SMB read at sample time, ground truth)
+            ...
         M01/
             20260508/                    (date subfolder, matches SMB layout)
                 08Drive.Log
@@ -61,6 +68,27 @@ import string
 import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Live SMB read of NcProgram\O100.txt — defensive cap (file is normally <2KB).
+LIVE_O100_MAX_BYTES = 64 * 1024
+LIVE_O100_TEMPLATE = r"\\{ip}\NcProgram\O100.txt"
+
+
+def _import_o100_parser():
+    """Best-effort import of parsers.o100_parser. Returns parse fn or None.
+
+    usb_sample is otherwise stdlib-only; we only pull in the project parser
+    when needed for the live O100 probe so the script still runs on a stale
+    deploy without the Phase 3 code.
+    """
+    try:
+        if PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, PROJECT_ROOT)
+        from parsers.o100_parser import parse_o100_content
+        return parse_o100_content
+    except Exception as e:
+        print("WARN: o100_parser import failed ({}); raw will still be saved".format(e))
+        return None
 
 
 def load_settings():
@@ -284,6 +312,99 @@ def copy_kataoka_logs(backup_root, machines, out_dir, manifest, hashes,
     return copied
 
 
+def probe_live_o100(machines, out_dir, manifest, hashes):
+    """Read \\\\{ip}\\NcProgram\\O100.txt live from each Takeuchi machine.
+
+    Provides ground-truth tap at sample time so reviewer can cross-check
+    against o100_snapshots and machine_current_state.current_o100_subs in
+    the DB snapshot. Saves raw bytes plus a CSV summary.
+
+    No-op on non-Windows (SMB UNC paths can't resolve outside Windows).
+    Per-machine errors are captured in the CSV; the loop never aborts.
+    """
+    manifest.append("")
+    manifest.append("=== Live O100.txt SMB probe ===")
+    if os.name != "nt":
+        manifest.append("  SKIPPED (non-Windows; SMB unavailable)")
+        print("Live O100 probe: skipped (non-Windows)")
+        return 0
+
+    parse_fn = _import_o100_parser()
+    extras_dir = os.path.join(out_dir, "extras")
+    os.makedirs(extras_dir, exist_ok=True)
+    csv_path = os.path.join(extras_dir, "o100_live_probe.csv")
+    live_root = os.path.join(out_dir, "o100_live")
+
+    rows = []
+    n_ok = 0
+    n_takeuchi = 0
+    for m in machines:
+        if m.get("type") != "takeuchi":
+            continue
+        n_takeuchi += 1
+        mid = m["id"]
+        ip = m.get("ip", "")
+        probed_at = datetime.datetime.now().isoformat()
+
+        if not ip:
+            rows.append([mid, ip, probed_at, "", "", "", "", "no_ip", "machines.json missing ip"])
+            manifest.append("  {} SKIP no ip in machines.json".format(mid))
+            continue
+
+        path = LIVE_O100_TEMPLATE.format(ip=ip)
+        try:
+            st = os.stat(path)
+            size = st.st_size
+            mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime).isoformat()
+            if size > LIVE_O100_MAX_BYTES:
+                rows.append([mid, ip, probed_at, mtime_iso, str(size), "", "", "too_large", ""])
+                manifest.append("  {} SKIP size={} > {} bytes".format(mid, size, LIVE_O100_MAX_BYTES))
+                continue
+            with open(path, "rb") as f:
+                raw = f.read()
+            sha = hashlib.sha256(raw).hexdigest()
+
+            mid_dir = os.path.join(live_root, mid)
+            os.makedirs(mid_dir, exist_ok=True)
+            dst = os.path.join(mid_dir, "O100.txt")
+            with open(dst, "wb") as fw:
+                fw.write(raw)
+            rel = os.path.relpath(dst, out_dir).replace("\\", "/")
+            hashes.append((rel, sha))
+
+            active_subs = ""
+            parse_status = "no_parser"
+            if parse_fn is not None:
+                try:
+                    parsed = parse_fn(raw.decode("cp932", errors="replace"))
+                    active_subs = json.dumps(parsed.get("active_subs", []))
+                    parse_status = "ok"
+                except Exception as e:
+                    parse_status = "parse_fail:{}".format(type(e).__name__)
+
+            rows.append([mid, ip, probed_at, mtime_iso, str(size), sha[:16],
+                         active_subs, parse_status, ""])
+            manifest.append("  {} OK size={}B mtime={} active_subs={}".format(
+                mid, size, mtime_iso, active_subs or "(unparsed)"))
+            n_ok += 1
+        except OSError as e:
+            rows.append([mid, ip, probed_at, "", "", "", "", "smb_error",
+                         "{}: {}".format(type(e).__name__, e)])
+            manifest.append("  {} SMB error: {}".format(mid, e))
+        except Exception as e:
+            rows.append([mid, ip, probed_at, "", "", "", "", "fail",
+                         "{}: {}".format(type(e).__name__, e)])
+            manifest.append("  {} unexpected error: {}".format(mid, e))
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["machine_id", "ip", "probed_at_local", "smb_mtime",
+                    "smb_size", "sha256_short", "active_subs", "status", "error"])
+        w.writerows(rows)
+    print("Live O100 probe: {}/{} OK".format(n_ok, n_takeuchi))
+    return n_ok
+
+
 def copy_app_log(out_dir, manifest, hashes):
     """Copy drill_monitor.log + rotation backups (drill_monitor.log.1..5)."""
     manifest.append("")
@@ -329,7 +450,7 @@ def snapshot_db(db_path, out_dir, manifest):
     return dst
 
 
-def export_extras(snapshot_db_path, out_dir, manifest):
+def export_extras(snapshot_db_path, out_dir, manifest, hashes):
     """Always-on small exports: schema.sql + cycle_stats.csv.
 
     Run against the snapshot copy (not the live DB) to avoid holding any
@@ -342,6 +463,15 @@ def export_extras(snapshot_db_path, out_dir, manifest):
     os.makedirs(extras_dir, exist_ok=True)
     manifest.append("")
     manifest.append("=== Extras ===")
+
+    # machines.json — needed for per-machine TZ + IP verification on dev side.
+    src_machines = os.path.join(PROJECT_ROOT, "config", "machines.json")
+    if os.path.isfile(src_machines):
+        dst_machines = os.path.join(extras_dir, "machines.json")
+        shutil.copy2(src_machines, dst_machines)
+        _record_copied(dst_machines, out_dir, hashes, manifest, "extras/machines.json")
+    else:
+        manifest.append("  extras/machines.json MISSING (source not found)")
 
     conn = sqlite3.connect(snapshot_db_path)
     try:
@@ -466,11 +596,14 @@ def main():
     print("Copying app log...")
     n_app_log = copy_app_log(out_dir, manifest, hashes)
 
+    print("Probing live O100.txt over SMB...")
+    n_o100_live = probe_live_o100(machines, out_dir, manifest, hashes)
+
     print("Snapshotting DB...")
     snapshot_path = snapshot_db(db_path, out_dir, manifest)
 
-    print("Exporting schema + cycle_stats...")
-    export_extras(snapshot_path, out_dir, manifest)
+    print("Exporting schema + cycle_stats + machines.json...")
+    export_extras(snapshot_path, out_dir, manifest, hashes)
 
     write_sha256_manifest(out_dir, hashes)
 
@@ -482,6 +615,7 @@ def main():
     print("  Takeuchi files: {}".format(n_takeuchi_files))
     print("  Kataoka files:  {}".format(n_kataoka_files))
     print("  App log files:  {}".format(n_app_log))
+    print("  Live O100 OK:   {}".format(n_o100_live))
     print("  SHA256 entries: {}".format(len(hashes)))
     if missing:
         print("  Missing Takeuchi folders: {}".format(len(missing)))
