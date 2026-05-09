@@ -270,19 +270,25 @@ def copy_kataoka_logs(backup_root, machines, out_dir, manifest, hashes,
             if not os.path.isdir(src_dir):
                 manifest.append("  {}/{} MISSING (no folder)".format(mid, date_str))
                 continue
-            fname = "{}_ClsPLCTrd.log".format(date_str)
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                any_copied = True
-                dst_subdir = os.path.join(out_dir, mid, date_str)
-                os.makedirs(dst_subdir, exist_ok=True)
-                dst = os.path.join(dst_subdir, fname)
-                shutil.copy2(src, dst)
-                _record_copied(dst, out_dir, hashes, manifest,
-                               "{}/{}/{}".format(mid, date_str, fname))
-                copied += 1
-            else:
-                manifest.append("  {}/{}/{} MISSING".format(mid, date_str, fname))
+            # Laser parser needs three files together (ClsPLCTrd for beam events,
+            # ClsLaserCom for RUN intervals, PhysicalMemory for heartbeat). Backfill
+            # tools that re-call parse_laser_machine() short-circuit if ClsLaserCom
+            # is missing, so always pull all three.
+            for fname in ("{}_ClsPLCTrd.log".format(date_str),
+                          "{}_ClsLaserCom.log".format(date_str),
+                          "{}_PhysicalMemory.log".format(date_str)):
+                src = os.path.join(src_dir, fname)
+                if os.path.isfile(src):
+                    any_copied = True
+                    dst_subdir = os.path.join(out_dir, mid, date_str)
+                    os.makedirs(dst_subdir, exist_ok=True)
+                    dst = os.path.join(dst_subdir, fname)
+                    shutil.copy2(src, dst)
+                    _record_copied(dst, out_dir, hashes, manifest,
+                                   "{}/{}/{}".format(mid, date_str, fname))
+                    copied += 1
+                else:
+                    manifest.append("  {}/{}/{} MISSING".format(mid, date_str, fname))
 
         # Copy programs/ dir (work order files: ProcTimeStart.txt, ProcTimeEnd.txt, ...)
         # L1 currently has no INFO share so this dir won't exist.
