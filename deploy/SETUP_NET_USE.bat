@@ -24,7 +24,9 @@ echo.
 REM --- Clean any stale mappings first ---
 echo [Step 1] Removing stale mappings (ignore errors)...
 for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
-    net use \\10.10.1.%%i /delete >nul 2>&1
+    net use \\10.10.1.%%i\LOG       /delete >nul 2>&1
+    net use \\10.10.1.%%i\NcProgram /delete >nul 2>&1
+    net use \\10.10.1.%%i           /delete >nul 2>&1
 )
 REM Laser machines (L1-L4: .31-.34). L1 only has LOG share (no INFO yet).
 net use \\10.10.1.31\LOG /delete >nul 2>&1
@@ -38,11 +40,17 @@ echo [Step 2] Creating persistent mappings...
 echo.
 
 REM --- 18 Takeuchi machines, /persistent:yes ---
+REM Each gets LOG (log_collector) + NcProgram (o100_observer Phase 3).
 for %%i in (11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28) do (
     echo   Mapping \\10.10.1.%%i\LOG ...
     net use \\10.10.1.%%i\LOG "" /user:Takeuchi /persistent:yes
     if errorlevel 1 (
         echo     WARNING: failed to map \\10.10.1.%%i\LOG
+    )
+    echo   Mapping \\10.10.1.%%i\NcProgram ...
+    net use \\10.10.1.%%i\NcProgram "" /user:Takeuchi /persistent:yes
+    if errorlevel 1 (
+        echo     WARNING: failed to map \\10.10.1.%%i\NcProgram
     )
 )
 

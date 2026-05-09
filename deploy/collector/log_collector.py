@@ -150,6 +150,61 @@ def collect_logs_for_machine(machine, settings):
         return False
 
 
+def remount_smb_share(machine, machines_config):
+    """Force-clear and re-establish a stale SMB mapping for one machine.
+
+    Power loss can leave a Windows SMB session in a "Disconnected" state with
+    a bad cached NTLM token; subsequent access then fails with "auth fail"
+    (not "path not found") even though the remote share is alive. A plain
+    `net use /persistent:yes` becomes a no-op when the mapping name already
+    exists, so the only reliable fix is delete-then-mount.
+
+    Args:
+        machine: Machine config dict (id, ip).
+        machines_config: Full machines config (for smb_user / log_share_name).
+
+    Returns:
+        bool: True if re-mount succeeded.
+    """
+    if platform.system() != "Windows":
+        return False
+
+    machine_id = machine["id"]
+    ip = machine["ip"]
+    share_name = machines_config.get("log_share_name", "LOG")
+    user = machines_config.get("smb_user", "Takeuchi")
+    password = machines_config.get("smb_password", "")
+    target = "\\\\{}\\{}".format(ip, share_name)
+
+    try:
+        subprocess.run(
+            ["net", "use", target, "/delete", "/yes"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        logger.debug("[%s] net use /delete error (ignored): %s", machine_id, e)
+
+    try:
+        result = subprocess.run(
+            ["net", "use", target, password, "/user:" + user, "/persistent:yes"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            logger.info("[%s] SMB re-mount OK (%s)", machine_id, target)
+            return True
+        logger.warning(
+            "[%s] SMB re-mount failed (%s): %s",
+            machine_id, target, (result.stderr or result.stdout)[:200].strip(),
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("[%s] SMB re-mount timed out", machine_id)
+        return False
+    except Exception as e:
+        logger.warning("[%s] SMB re-mount error: %s", machine_id, e)
+        return False
+
+
 def update_machine_health(db_path, machine_id, success):
     """Update machine_health table after collection attempt.
 
@@ -219,6 +274,15 @@ def run_collection_cycle(settings=None, machines_config=None, db_path=None):
         if should_skip_backoff(db_path, machine["id"], settings):
             continue
         success = collect_logs_for_machine(machine, settings)
+        # Stale SMB mappings (auth-fail despite reachable host) survive across
+        # cycles — backoff alone won't recover them. On failure, force a
+        # delete+remount once and retry before giving up to backoff.
+        if not success and platform.system() == "Windows":
+            logger.info("[%s] robocopy failed; attempting SMB re-mount + retry", machine["id"])
+            if remount_smb_share(machine, machines_config):
+                success = collect_logs_for_machine(machine, settings)
+                if success:
+                    logger.info("[%s] Retry after re-mount succeeded", machine["id"])
         try:
             update_machine_health(db_path, machine["id"], success)
         except Exception as e:

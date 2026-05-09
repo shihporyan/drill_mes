@@ -349,6 +349,14 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     util_today = round(run_secs / total_secs * 100, 1) if total_secs > 0 else 0.0
                     hole_count_today = util_data.get("holes", 0) or 0
 
+                # O100.txt board-routing snapshot (Takeuchi only). Parsed
+                # back from JSON so the frontend can render the list directly.
+                o100_subs_raw = state_data.get("current_o100_subs")
+                try:
+                    o100_subs = json.loads(o100_subs_raw) if o100_subs_raw else None
+                except (TypeError, ValueError):
+                    o100_subs = None
+
                 machines.append({
                     "id": mid,
                     "type": machine_type,
@@ -364,6 +372,8 @@ class DrillAPIHandler(BaseHTTPRequestHandler):
                     "counter": state_data.get("counter", 0),
                     "work_order": state_data.get("work_order"),
                     "work_order_side": state_data.get("work_order_side"),
+                    "current_o100_subs": o100_subs,
+                    "o100_captured_at": state_data.get("o100_captured_at"),
                 })
 
                 if state == "RUN":

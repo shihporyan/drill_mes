@@ -29,7 +29,32 @@ CREATE TABLE IF NOT EXISTS machine_current_state (
     last_update   TEXT,              -- ISO timestamp: last update
     counter       INTEGER,           -- col 10 cumulative value
     work_order    TEXT,              -- e.g. 'O2604016' (Takeuchi) or 'WD-2604008-TOP-A' (Kataoka)
-    work_order_side TEXT             -- 'B' (bottom) or 'T' (top)
+    work_order_side TEXT,            -- 'B' (bottom) or 'T' (top)
+    -- O100.txt board-routing snapshot (Takeuchi only). active_subs is JSON
+    -- list of int M98P sub-program numbers under the O100 entry section,
+    -- e.g. '[127, 128, 102]'. Updated by parsers/o100_observer.py.
+    current_o100_subs   TEXT,
+    current_o100_hash   TEXT,
+    o100_captured_at    TEXT
+);
+
+-- O100.txt snapshots — one row per detected change (dedup by content_hash).
+-- Capture path: parsers/o100_observer.py polls SMB every 5 min; on mtime/size
+-- change reads the file, parses, and inserts. Also called by tx1_log_parser
+-- when a FILEOPERATION LOAD event is detected (with TZ-corrected event_ts).
+-- See notes/mech_drill_board_identification.md Phase 3.
+CREATE TABLE IF NOT EXISTS o100_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id      TEXT NOT NULL,
+    captured_at     TEXT NOT NULL,    -- server time (TST) when recorded
+    trigger_source  TEXT NOT NULL,    -- 'mtime_change' / 'tx1_event' / 'initial'
+    smb_mtime       TEXT,             -- file mtime (TST, from os.stat)
+    smb_size        INTEGER,          -- file size in bytes
+    content_hash    TEXT NOT NULL,    -- sha256 of normalized content
+    active_subs     TEXT NOT NULL,    -- JSON list of int (e.g. '[127,128,102]')
+    raw_content     TEXT,             -- full O100.txt (typically <2KB)
+    tx1_event_ts    TEXT,             -- TZ-corrected TX1 LoadProgram ts when source='tx1_event'
+    UNIQUE(machine_id, content_hash, smb_mtime)
 );
 
 -- State transition events (for downtime analysis)
@@ -154,3 +179,4 @@ CREATE INDEX IF NOT EXISTS idx_tx1_latency_machine ON tx1_event_latency(machine_
 CREATE INDEX IF NOT EXISTS idx_log_observe_machine ON log_file_observe(machine_id, log_type, observed_at);
 CREATE INDEX IF NOT EXISTS idx_tx1_mtime_machine ON tx1_mtime_events(machine_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_cycle_stats_start ON cycle_stats(cycle_start);
+CREATE INDEX IF NOT EXISTS idx_o100_machine_time ON o100_snapshots(machine_id, captured_at DESC);

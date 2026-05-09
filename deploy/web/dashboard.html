@@ -273,6 +273,12 @@ function OverviewTab({data}) {
                       <div style={{textAlign:"right"}}>
                         <div style={{fontSize:10,color:"#9ca3af"}}>工號</div>
                         <div style={{fontSize:12,fontWeight:600,color:"#374151"}}>{m.work_order}{m.work_order_side ? `.${m.work_order_side}` : ""}</div>
+                        {m.type === "takeuchi" && Array.isArray(m.current_o100_subs) && m.current_o100_subs.length > 0 && (
+                          <div title={m.o100_captured_at ? `O100 更新: ${m.o100_captured_at}` : ""}
+                               style={{fontSize:10,color:"#6b7280",fontFamily:"ui-monospace, monospace",marginTop:1}}>
+                            [{m.current_o100_subs.join(",")}]
+                          </div>
+                        )}
                       </div>
                     ) : null}
                   </div>
@@ -301,27 +307,33 @@ function RankingBarChart({data, drillLevel, onBarClick, accentColor, chartH}) {
   const reservedTop = 32;
   const effectiveH = chartH - reservedTop;
   const paddingTop = 20;
-  // y position helper for util value v (0-100)
+  // y position helper for util value v (0-100); the bar/Y-axis grid lives in
+  // the bars row only — date/holes labels are in a separate row below so they
+  // don't push the bar tops up off the Y-axis.
   const yFor = v => paddingTop + chartH - effectiveH * v / maxVal;
+  const gap = drillLevel === "year" ? 4 : 12;
+  const canClickAt = (d) => d.util !== null && onBarClick && (drillLevel === "year" || drillLevel === "month");
   return (
-    <div style={{position:"relative",height:chartH+60,paddingTop:paddingTop}}>
-      {/* Target line */}
-      <div style={{position:"absolute",left:0,right:0,top:yFor(TARGET),display:"flex",alignItems:"center"}}>
-        <div style={{flex:1,borderTop:`2px dashed ${COLOR_TARGET}`}}/>
-        <span style={{fontSize:11,color:COLOR_TARGET,fontWeight:600,marginLeft:6,padding:"2px 6px",background:"#eff6ff",borderRadius:4,whiteSpace:"nowrap"}}>目標 {TARGET}%</span>
-      </div>
+    <div style={{position:"relative",paddingTop:paddingTop}}>
       {/* Y-axis labels */}
       {[0,25,50,75,100].map(v=>(
         <div key={v} style={{position:"absolute",left:0,top:yFor(v)-6,fontSize:10,color:"#d1d5db"}}>{v}%</div>
       ))}
-      {/* Bars */}
-      <div style={{display:"flex",alignItems:"flex-end",height:chartH,paddingLeft:32,gap:drillLevel==="year"?4:12}}>
+      {/* Target line + chip — separate absolute elements so the dashed line
+          sits exactly at yFor(TARGET) (the old flex+alignItems:center wrapper
+          centered the line vertically against the chip span, pushing it ~10px
+          below the Y-axis 75% tick). */}
+      <div style={{position:"absolute",left:32,right:70,top:yFor(TARGET),borderTop:`2px dashed ${COLOR_TARGET}`}}/>
+      <div style={{position:"absolute",right:0,top:yFor(TARGET),transform:"translateY(-50%)",fontSize:11,color:COLOR_TARGET,fontWeight:600,padding:"2px 6px",background:"#eff6ff",borderRadius:4,whiteSpace:"nowrap"}}>目標 {TARGET}%</div>
+      {/* Bars row — contains only dot + pct label + bar, so bar bottoms align
+          with yFor(0) and tops with yFor(util). */}
+      <div style={{display:"flex",alignItems:"flex-end",height:chartH,paddingLeft:32,gap:gap}}>
         {data.map((d,i)=>{
           const hasData = d.util !== null;
           const h = hasData ? Math.max(2, effectiveH * d.util / maxVal) : 2;
           const barColor = hasData ? accentColor : COLOR_NO_DATA;
           const barOpacity = !hasData ? 1 : (d.util >= TARGET ? 1 : 0.45);
-          const canClick = hasData && onBarClick && ((drillLevel==="year") || (drillLevel==="month"));
+          const canClick = hasData && canClickAt(d);
           return (
             <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",cursor:canClick?"pointer":"default"}}
               onClick={()=>{ if(canClick) onBarClick(i,d); }}>
@@ -331,7 +343,20 @@ function RankingBarChart({data, drillLevel, onBarClick, accentColor, chartH}) {
               {hasData && <div style={{fontSize:12,fontWeight:700,color:COLOR_TEXT_PRIMARY,marginBottom:4}}>{Math.round(d.util)}%</div>}
               <div style={{width:"100%",maxWidth:drillLevel==="year"?40:56,height:h,background:barColor,borderRadius:"4px 4px 0 0",transition:"height 0.4s",
                 opacity:barOpacity,minHeight:2}}/>
-              <div style={{fontSize:11,fontWeight:d.isCurrent?700:500,color:d.isCurrent?COLOR_TARGET:COLOR_TEXT_SECONDARY,marginTop:6}}>{d.label}</div>
+            </div>
+          );
+        })}
+      </div>
+      {/* X-axis labels row (date + holes) — pulled out of bars so they don't
+          push the bar geometry. Same paddingLeft + gap to keep columns aligned. */}
+      <div style={{display:"flex",paddingLeft:32,gap:gap,marginTop:6}}>
+        {data.map((d,i)=>{
+          const hasData = d.util !== null;
+          const canClick = hasData && canClickAt(d);
+          return (
+            <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",cursor:canClick?"pointer":"default"}}
+              onClick={()=>{ if(canClick) onBarClick(i,d); }}>
+              <div style={{fontSize:11,fontWeight:d.isCurrent?700:500,color:d.isCurrent?COLOR_TARGET:COLOR_TEXT_SECONDARY}}>{d.label}</div>
               {hasData && <div title={fmt(d.holes)+" 孔"} style={{fontSize:10,color:COLOR_TEXT_MUTED,marginTop:1}}>{fmtCompact(d.holes)} 孔</div>}
               {!hasData && <div style={{fontSize:10,color:"#d1d5db",marginTop:1}}>—</div>}
             </div>
@@ -954,6 +979,15 @@ function DetailTab({overviewData}) {
                     </div>
                   ))}
                 </div>
+                {m.type === "takeuchi" && Array.isArray(m.current_o100_subs) && m.current_o100_subs.length > 0 && (
+                  <div title={m.o100_captured_at ? `更新時間: ${m.o100_captured_at}` : ""}
+                       style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:8,padding:"6px 10px",background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6}}>
+                    <span style={{fontSize:10,color:"#9ca3af"}}>板別 sub</span>
+                    <span style={{fontSize:12,fontWeight:600,color:"#374151",fontFamily:"ui-monospace, monospace"}}>
+                      [{m.current_o100_subs.join(", ")}]
+                    </span>
+                  </div>
+                )}
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,background:"#f0fdf4",border:"1px solid #bbf7d0"}}>
                   <span style={{fontSize:12,color:"#059669",fontWeight:500}}>今日孔數</span>
                   <span style={{fontSize:18,fontWeight:800,color:"#059669",fontVariantNumeric:"tabular-nums"}}>{fmt(m.hole_count_today)}</span>

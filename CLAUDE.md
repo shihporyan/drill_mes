@@ -68,3 +68,6 @@ npm run test:e2e:ui
 - [notes/kataoka_notebooklm_queries.md](notes/kataoka_notebooklm_queries.md) — 給 NotebookLM 的 3 個 prompt（ProcTimeStart 行為 / station 起訖時間 / 孔數 & 板別）
 - [notes/data_anomaly_apr01_holes.md](notes/data_anomaly_apr01_holes.md) — 2026-04-01/02 孔數爆量異常（百萬級），疑似 4/23 修復前 backfill 重複，待清理
 - [notes/dashboard_audit_20260428.md](notes/dashboard_audit_20260428.md) — 4/28 USB 快照資料稽核：修了什麼 / 未修觀察 / 已確認正確的資料
+- [notes/smb_stale_session_after_power_loss.md](notes/smb_stale_session_after_power_loss.md) — 5/7 跳電後 M01/M13/M14 SMB session 壞掉事件：症狀、根因、永久修法
+- [notes/parser_cycle_15min_hang_20260504.md](notes/parser_cycle_15min_hang_20260504.md) — 5/4 cycle 跑 944s 導致 API connection refused：根因分析、WinError 10053 是症狀、5/8 加 per-step 耗時 log + WAL 保險
+- [notes/dashboard_lan_rebind_20260508.md](notes/dashboard_lan_rebind_20260508.md) — 5/8 下午 dashboard 從 NIC1 改綁 NIC2 (192.168.2.50:8080)，含 caveat（沒 NSSM、沒 IP whitelist）+ 驗收 checklist

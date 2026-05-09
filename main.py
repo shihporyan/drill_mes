@@ -34,6 +34,7 @@ from parsers.drive_log_parser import run_parser_cycle, run_parser_loop
 from parsers.tx1_log_parser import run_parser_cycle as run_tx1_parser_cycle
 from parsers.laser_log_parser import run_parser_cycle as run_laser_parser_cycle
 from parsers.mtime_observer import start_observer_thread as start_mtime_observer
+from parsers.o100_observer import start_observer_thread as start_o100_observer
 from collector.log_collector import run_collection_cycle, run_collection_loop
 from collector.laser_log_collector import run_collection_cycle as run_laser_collection_cycle
 from server.api_server import run_server
@@ -106,15 +107,23 @@ def run_collect_and_parse_loop(settings, machines_config, db_path):
         cycle_start = datetime.datetime.now()
         steps_ok = 0
         failed = []
+        step_timings = []
 
         for step_name, step_fn in steps:
             logger.info("--- %s ---", step_name)
+            step_start = time.monotonic()
             try:
                 step_fn()
                 steps_ok += 1
             except Exception as e:
                 logger.error("%s failed: %s", step_name, e, exc_info=True)
                 failed.append(step_name)
+            step_timings.append((step_name, int((time.monotonic() - step_start) * 1000)))
+
+        logger.info(
+            "Cycle step timings: %s",
+            ", ".join("%s=%dms" % (n, ms) for n, ms in step_timings),
+        )
 
         cycle_end = datetime.datetime.now()
         took_ms = int((cycle_end - cycle_start).total_seconds() * 1000)
@@ -226,6 +235,16 @@ def run_all():
         logger.info("TX1 mtime observer thread started (30s interval)")
     except Exception as e:
         logger.warning("Failed to start TX1 mtime observer: %s", e)
+
+    # Start O100.txt observer (Phase 3: board-routing snapshot via NcProgram
+    # SMB share). 5min poll backstop; tx1_log_parser also triggers on-demand
+    # reads via record_tx1_triggered_snapshot. See
+    # notes/mech_drill_board_identification.md Phase 3.
+    try:
+        start_o100_observer(db_path=db_path, settings=settings, machines_config=machines_config)
+        logger.info("O100 observer thread started (300s interval)")
+    except Exception as e:
+        logger.warning("Failed to start O100 observer: %s", e)
 
     # Run API server in main thread (blocking)
     host = settings.get("http_host", "127.0.0.1")

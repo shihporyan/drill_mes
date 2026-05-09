@@ -35,6 +35,7 @@ from parsers.base_parser import (
 )
 from parsers.drive_log_parser import extract_work_order
 from parsers.flush_observer import observe_takeuchi_logs
+from parsers.o100_observer import record_tx1_triggered_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,8 @@ def parse_fileoperation_line(line):
     return {"timestamp": iso_ts, "program_name": program_name}
 
 
-def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=None):
+def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=None,
+                   machine_ip=None, tz_offset_hours=0):
     """Parse TX1.Log incrementally and update work order in machine_current_state.
 
     Args:
@@ -74,6 +76,11 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=Non
         reference_date: Expected date for this file's events. Events more than
             2 days before this date are skipped (stale previous-month data).
             Defaults to today.
+        machine_ip: Control PC IP. Required to trigger O100.txt snapshot read
+            on LoadProgram O100.txt events. None disables that hook.
+        tz_offset_hours: Per-machine TX1 timezone offset (M14/M15/M18=1 for
+            JST→TST conversion). See notes/mech_drill_board_identification.md
+            Phase 4 #1.
     """
     if not os.path.exists(log_path):
         return
@@ -150,6 +157,18 @@ def parse_tx1_file(db_path, machine_id, log_path, day_prefix, reference_date=Non
                 last_wo = wo
                 last_side = side
                 last_ts = event["timestamp"]
+
+            # O100.txt LoadProgram → trigger live SMB read + snapshot record.
+            # NAME:[O100.txt] is the only program_name we care about here;
+            # production WO loads (e.g. O2604016.T) don't change board routing.
+            if machine_ip and event["program_name"].strip().lower().endswith("o100.txt"):
+                try:
+                    record_tx1_triggered_snapshot(
+                        conn, machine_id, machine_ip,
+                        event["timestamp"], tz_offset_hours,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] o100 tx1-hook failed: %s", machine_id, e)
 
         # Update machine_current_state with work order (targeted UPDATE only)
         if last_wo is not None:
@@ -327,6 +346,7 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
     for machine in takeuchi_machines:
         machine_id = machine["id"]
         machine_ip = machine.get("ip")
+        tz_offset_hours = machine.get("tx1_tz_offset_hours", 0)
 
         # Observe remote log file metadata (6 types) for flush-latency
         # investigation. Runs once per cycle per machine.
@@ -344,7 +364,8 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
         yesterday_progress_key = "tx1_{}".format(yesterday_prefix)
         try:
             parse_tx1_file(db_path, machine_id, yesterday_path, yesterday_prefix,
-                           reference_date=yesterday)
+                           reference_date=yesterday,
+                           machine_ip=machine_ip, tz_offset_hours=tz_offset_hours)
         except Exception as e:
             logger.error("[%s] TX1 parser error (prev-day): %s", machine_id, e, exc_info=True)
 
@@ -352,7 +373,8 @@ def run_parser_cycle(db_path=None, settings=None, machines_config=None):
         log_path = get_tx1_log_path(settings, machine_id, day_prefix)
         try:
             parse_tx1_file(db_path, machine_id, log_path, day_prefix,
-                           reference_date=today)
+                           reference_date=today,
+                           machine_ip=machine_ip, tz_offset_hours=tz_offset_hours)
         except Exception as e:
             logger.error("[%s] TX1 parser error: %s", machine_id, e, exc_info=True)
 

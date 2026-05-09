@@ -77,6 +77,7 @@ def init_database(db_path=None):
     _dedupe_state_transitions_pre_schema(db_path)
 
     with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(schema_sql)
         logger.info("Database initialized: %s", db_path)
 
@@ -151,6 +152,44 @@ def _run_migrations(db_path):
         if "work_order_side" not in columns:
             conn.execute("ALTER TABLE machine_current_state ADD COLUMN work_order_side TEXT")
             logger.info("Migration: added work_order_side column to machine_current_state")
+
+        # Phase 3: O100.txt board-routing snapshot fields
+        if "current_o100_subs" not in columns:
+            conn.execute("ALTER TABLE machine_current_state ADD COLUMN current_o100_subs TEXT")
+            logger.info("Migration: added current_o100_subs to machine_current_state")
+        if "current_o100_hash" not in columns:
+            conn.execute("ALTER TABLE machine_current_state ADD COLUMN current_o100_hash TEXT")
+            logger.info("Migration: added current_o100_hash to machine_current_state")
+        if "o100_captured_at" not in columns:
+            conn.execute("ALTER TABLE machine_current_state ADD COLUMN o100_captured_at TEXT")
+            logger.info("Migration: added o100_captured_at to machine_current_state")
+
+        # Phase 3: o100_snapshots table (covered by schema.sql IF NOT EXISTS,
+        # but record migration log for visibility on existing DBs)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='o100_snapshots'"
+        )
+        if not cursor.fetchone():
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS o100_snapshots (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    machine_id      TEXT NOT NULL,
+                    captured_at     TEXT NOT NULL,
+                    trigger_source  TEXT NOT NULL,
+                    smb_mtime       TEXT,
+                    smb_size        INTEGER,
+                    content_hash    TEXT NOT NULL,
+                    active_subs     TEXT NOT NULL,
+                    raw_content     TEXT,
+                    tx1_event_ts    TEXT,
+                    UNIQUE(machine_id, content_hash, smb_mtime)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_o100_machine_time "
+                "ON o100_snapshots(machine_id, captured_at DESC)"
+            )
+            logger.info("Migration: created o100_snapshots table")
 
         # Ensure laser_work_orders table exists (for existing databases)
         cursor = conn.execute(

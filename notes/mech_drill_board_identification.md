@@ -6,6 +6,23 @@
 
 > ⚡ **5/3 重大突破 — 機制完全釐清，跳到下方「5/3 突破：O100.txt 機制 + 實作計畫」章節看最新理解。** 4/30 之前所有調查（INPUT 事件 / MACRO BLK / R 參數 / fingerprint）都不是主路徑，只是誤打誤撞接近真相的旁支證據。
 
+## 5/8 決策：併板 NC 表對映規則 — 先不做
+
+**狀態：** 已決定**暫不實作**自動「sub 編號 → 板別」對映；等之後有需求再追加。
+
+**理由：**
+- M16 併板 active_subs 跨 4 個百位範圍（[123,124,102,223,202,322,323,302,423,402]）顯示 1 份 O100.txt 可對應多張 WD，「百位數 → WD 序號」是否為固定 convention 還沒跟工程端確認
+- NC 表 Excel 命名規則 / 儲存路徑也未確認
+- 上線優先度高於這個分析功能；先讓 O100 觀測本身可靠（Phase 3）即可
+
+**未來追加修正時要做的事：**
+1. 跟工程端確認 WD 序號 ↔ 百位數的固定 convention
+2. 取得 NC 表 Excel 命名規則 + 儲存通道
+3. 在 parser 加「百位切群 → 對 WD ↔ 板別」邏輯
+4. Dashboard 顯示「現在在鑽 WD-X 的 F 板 + WD-Y 的 B 板」
+
+**現階段 dashboard 可呈現範圍：** raw active_subs 數字列表（不翻譯成板別）；併板情境下會顯示原始多範圍編號，由人眼判讀。
+
 ## 5/3 突破：O100.txt 機制 + 實作計畫
 
 ### 突破來源
@@ -220,26 +237,109 @@ dev 環境只有一份 snapshot，所有事件都對應同一 hash。production 
 - FILE.Log: CP932（含日文 prose）+ CRLF → 同上
 - Hash normalization: `line.rstrip()` per line + `.rstrip()` 全文 → 排除 trailing 空行 / CRLF/LF 差異
 
-### Phase 3：DB schema + 寫入（待用戶確認 schema 後做）
+### Phase 3：✅ 5/8 完成（DB schema + observer + parser hook + dashboard）
 
-**草案：**
+**實作檔：**
+- [config/machines.json](../config/machines.json) — 加 `tx1_tz_offset_hours`（M14/M15/M18=1，其他=0）
+- [db/schema.sql](../db/schema.sql) + [db/init_db.py](../db/init_db.py) — `o100_snapshots` 表 + `machine_current_state` 加 3 欄 + 完整 migration
+- [parsers/o100_observer.py](../parsers/o100_observer.py) — 5min mtime polling thread + `record_tx1_triggered_snapshot()` 給 TX1 hook 用
+- [parsers/tx1_log_parser.py](../parsers/tx1_log_parser.py) — FILEOPERATION LOAD `O100.txt` 事件呼叫 observer，TX1 ts 套 per-machine TZ
+- [main.py](../main.py) — `start_o100_observer` 起 daemon thread
+- [server/api_server.py](../server/api_server.py) — `/api/drilling/overview` 回傳 `current_o100_subs` + `o100_captured_at`
+- [web/dashboard.html](../web/dashboard.html) — RUN takeuchi 卡片在工號下方加 `[127,128,102]` 顯示
+
+**dev 驗證：** 5/8 在 Mac dev DB 跑 init_db migrations、record_snapshot 寫入、API JSON 回傳、dashboard 渲染都通過。production 部署後第一次 cycle 會 initial-snapshot 全 18 台，後續 5min 抓 mtime 變化。
+
+**production 部署檢查清單：**
+1. 拷貝 6 個改動檔到 `C:\DrillMonitor\`：`config/machines.json`、`db/schema.sql`、`db/init_db.py`、`parsers/o100_observer.py`、`parsers/tx1_log_parser.py`、`main.py`、`server/api_server.py`、`web/dashboard.html`
+2. 重啟 service（taskkill python + start_monitor.bat）
+3. 開機後 log 應印 `O100 observer thread started (300s interval)`
+4. 5 分鐘後查 `o100_snapshots` 表應有 18 台 `trigger_source='initial'` 的 row
+5. 操作員下次按 LOAD O100.txt → 看 log 印 `[Mxx] o100 mtime_change` 或 `tx1_event`
+6. dashboard RUN 卡片顯示 `[active_subs]`
+
+### Phase 3 原始設計（5/4，保留作背景參考）
+
+#### 設計原則（從 Phase 4 學到的）
+
+1. **SMB mtime 可信賴** — 不需 hash polling fallback for staleness
+2. **TX1 事件不夠**（漏 50% 孤兒編輯）→ 必須加 mtime backstop polling
+3. **TZ 必須 per-machine 處理** — M13 用 TST、M14/M15/M18 用 JST
+4. **變更頻率低**（小時級）→ polling 不需高頻
+
+#### 觸發策略：TX1 事件 + 5min backstop polling
+
+```
+parser_cycle (現有 30s tx1_log_parser cycle)：
+   For each Takeuchi machine:
+      A. 掃 TX1.Log 找新 LoadProgram O100.txt 事件
+         → 有事件 → 立刻 SMB stat + 讀全文 + parse + 寫 DB
+         → TX1 ts 套用 per-machine TZ 修正
+
+      B. 距離上次 stat 已 >5min？
+         → SMB stat O100.txt（只 mtime + size，不讀內容，極便宜）
+         → mtime 變了？ → 讀全文 + parse + 寫 DB
+         → mtime 沒變？ → skip
+```
+
+**預估成本：**
+- A 路徑：每台每天 ~10 events × 18 台 = 180 reads/day（每 read ~1KB）
+- B 路徑：每台 12 stat/h × 24h × 18 台 = 5,184 stat/day（每 stat 數十 byte）+ ~50 actual reads/day（mtime 觸發）
+- 總網路：<100KB/day
+
+#### DB schema 草案
+
 ```sql
 CREATE TABLE o100_snapshots (
     id INTEGER PRIMARY KEY,
     machine_id TEXT NOT NULL,
-    captured_at TIMESTAMP NOT NULL,
-    source TEXT NOT NULL,                  -- 'file_log' | 'live_smb'
-    content_hash TEXT NOT NULL,            -- 內容去重用
+    captured_at TIMESTAMP NOT NULL,        -- TST，已 TZ 修正
+    trigger_source TEXT NOT NULL,          -- 'tx1_event' | 'mtime_change' | 'initial'
+    smb_mtime TIMESTAMP NOT NULL,          -- 檔案 mtime（TST）
+    content_hash TEXT NOT NULL,            -- 去重 + 變更偵測
+    content_size INTEGER NOT NULL,
     active_subs TEXT NOT NULL,             -- JSON: [127, 128, 102]
-    raw_content BLOB,                      -- 完整 O100.txt（小檔，<2KB），保留供事後查
-    UNIQUE(machine_id, captured_at)
+    raw_content BLOB,                      -- 完整 O100.txt（<2KB），事後查用
+    UNIQUE(machine_id, content_hash, smb_mtime)
 );
 CREATE INDEX idx_o100_machine_time ON o100_snapshots(machine_id, captured_at DESC);
 
--- 加到 machine_current_state（dashboard 即時欄位）
-ALTER TABLE machine_current_state ADD COLUMN current_o100_subs TEXT;  -- JSON
+-- machine_current_state 加欄位（dashboard 即時顯示）
+ALTER TABLE machine_current_state ADD COLUMN current_o100_subs TEXT;
+ALTER TABLE machine_current_state ADD COLUMN current_o100_hash TEXT;
 ALTER TABLE machine_current_state ADD COLUMN o100_captured_at TIMESTAMP;
+
+-- 機台 TZ 配置（Phase 4 #1 發現）
+-- 簡單做法：寫死在 config/machines.json 加欄位
+-- {"id": "M14", "ip": "10.10.1.24", "type": "takeuchi", "tx1_tz_offset_hours": 1, ...}
 ```
+
+**dedup 邏輯：** UNIQUE(machine_id, content_hash, smb_mtime) 自然防止重複插入。同 hash + 同 mtime = 同一個 snapshot，無視 trigger_source。
+
+#### 邊界處理
+
+| 邊界 | 來源 | 處理 |
+|------|------|------|
+| `M98P` 後無數字（編輯一半 LOAD）| Phase 1+2 dev tool 在 M14 5/2 13:03 已見 | active_subs=[]，trigger_source 標 'partial_edit'，不更新 machine_current_state |
+| 重按 LOAD（同 hash） | Phase 4 觀察 0%，但仍可能 | UNIQUE 約束自然 dedup |
+| SMB 連線失敗 | M01-M12 perms 未開 | 記錯誤 log 但不阻塞其他機台 |
+| TX1 ts 在未來（時鐘跳） | clock skew | trust SMB mtime over TX1 ts |
+| O100 段不存在 | 異常 | active_subs=[]，記 warning |
+
+#### 部署順序
+
+1. ✅ parsers/o100_parser.py（Phase 1 已完成）
+2. machines.json 加 `tx1_tz_offset_hours` 欄位（M14/M15/M18 = 1，其他先設 0，等資料補）
+3. schema.sql 加 o100_snapshots 表 + 3 個欄位
+4. 寫 `parsers/o100_observer.py` 實作上述觸發策略
+5. tx1_log_parser.py hook：偵測到 LoadProgram O100.txt 事件時觸發 o100_observer
+6. dashboard 顯示 current_o100_subs（先以 raw 數字呈現，等 NC 表整合再翻譯成板別）
+
+#### 暫不處理（Phase 5 範圍）
+
+- NC 表 → 板別翻譯（需 MES 端 Excel 來源）
+- 併板情境的 WD 切群組（需確認百位數規則）
+- Layer 3 語意對映
 
 ### Phase 4 prep：NcProgram SMB 連線可行性 recon ✅（5/3 設定變更後新增）
 
@@ -279,6 +379,46 @@ python tools\probe_o100_ncprogram_access.py
 | M18 | 2026-05-03 09:40 | 478B | `[121, 102, 324, 302]` | TOP + BOT 混合 — 可能在做 .T+.B 連續鑽 |
 
 **M01-M12 perms 尚未開放** — 跟用戶討論是否一併開，或先靠 M14-style FILE.Log dump 處理。
+
+**5/8 更新：M01-M12 perms 已全部開放，現在 18 台 takeuchi 全可走 NcProgram share。** `tools/probe_o100_ncprogram_access.py` 的 `DEFAULT_MACHINES` 已更新為 M01-M18。
+
+**5/8 production recon 結果 — 18/18 OK：**
+
+| 機台 | size | mtime | active_subs | 觀察 |
+|------|------|-------|-------------|------|
+| M01 | 435 | 11:37 | [128,102] | TOP 1xx |
+| M02 | 370 | 08:09 | [143,102] | TOP 1xx |
+| M03 | 2490 | 10:18 | `[]` | 編輯中（partial_edit）|
+| M04 | 3061 | 08:05 | [141] | TOP 1xx，僅一個 sub |
+| M05 | 634 | 01:24 | [340,302] | BOT 3xx |
+| M06 | 2743 | 11:34 | [127,102] | TOP 1xx |
+| M07 | 377 | 08:14 | [142,102] | TOP 1xx |
+| M08 | 416 | 11:56 | [143,102] | TOP 1xx，跟 M02 同 sub |
+| M09 | 2819 | 10:29 | [126,102] | TOP 1xx |
+| M10 | 501 | 07:00 | [140,102] | TOP 1xx |
+| M11 | 2718 | 10:36 | [128,102] | TOP 1xx，跟 M01 同 sub |
+| **M12** | 3213 | 5/6 13:57 | **[130,102,326,302]** | **TOP+BOT 連續鑽**（同工單 .T+.B）|
+| M13 | 3201 | 5/7 01:57 | [126,127,102] | TOP 1xx |
+| **M14** | 391 | 10:21 | **[125,102]** | TOP 1xx |
+| **M15** | 381 | 10:34 | **[125,102]** | TOP 1xx，**跟 M14 完全同** |
+| **M16** | 440 | 10:44 | **[125,102]** | TOP 1xx，**跟 M14/M15 完全同** |
+| **M17** | 547 | 5/7 10:50 | **[124,125,102]** | TOP 1xx，**跟 M14-M16 同群（多一個 124）** |
+| M18 | 424 | 07:20 | [338,339,302] | BOT 3xx |
+
+**值得問操作員的觀察：**
+- **M14/M15/M16 active_subs 完全相同 [125,102]，加 M17 [124,125,102] = 4 台 1xx 群** — 同工單批量分流？同一個常用 sub 配置？
+- M01 / M11 都 [128,102]、M02 / M08 都 [143,102] — 也是分流 pattern
+
+**前置 net use 教訓（5/8）：**
+- 5/8 第一次 probe 18 台只 5 台 OK — 當時 `net use` 沒跑（user 手動關了 start.bat）
+- WinError 1326（11 台）/ 1385（M09/M10）/ 67（M17）三種
+- 跑 `SETUP_NET_USE.bat`（patch 加 NcProgram mapping）後 17/18 OK — 1326/1385 都是 stale session，**不是真權限問題**
+- WinError 1385 在乾淨 session 下會消失 — **以後遇到不要直覺判斷成「廠商鎖權限」**
+- WinError 67 才是真的「share 不存在」
+
+**M17 處理（5/8 已解）：** 第一次 probe 跑 WinError 67，後來操作員去 M17 control PC 把 `D:\Takeuchi\NcProgram` share 出來，重跑 SETUP_NET_USE.bat 後第二次 probe 就 OK 了（active_subs=[124,125,102]，mtime 是 5/7 10:50 — 表示 M17 已經幾小時沒換板）。
+
+**SETUP_NET_USE.bat / start_monitor.bat 5/8 patch：** 兩個 batch 都加上 `\\IP\NcProgram` 的 mapping（原本只 mount LOG）。Phase 3 observer 走 NcProgram share，沒先 mount 起來會跑不動。
 
 ### 併板（5/3 重大背景補充）
 
@@ -349,26 +489,69 @@ python tools\probe_o100_ncprogram_access.py
 - 各板別欄位（A/B/C 等）以「○」記號標示哪個 sub 用於哪片板（如 `102 = ○ all` 代表 102 是 A/B/C 共用）
 - 部分照片有 `板厚 1.6 / 0.8 / 1.0` 等差異 → A/B/C 板可能是不同板厚或不同板材的同類型板
 
-### Phase 4：SMB 延遲驗證 ✅ probe 完成（待 ncprogram recon 確認後部署）
+### Phase 4：SMB 延遲驗證 ✅ 完成（5/3-5/4 production 跑 17.5h）
 
-**檔案：** [tools/probe_o100_smb_latency.py](../tools/probe_o100_smb_latency.py)（新增）
+**檔案：**
+- [tools/probe_o100_smb_latency.py](../tools/probe_o100_smb_latency.py) — long-running probe
+- [tools/analyze_o100_probe.py](../tools/analyze_o100_probe.py) — CSV 分析器（內含 JST→TST 修正）
 
-**運作：** 長時間 background 跑（建議 1 整工作天 8h+），每 30s 對 18 台 Takeuchi 做：
-1. Stat live SMB `\\{ip}\LOG\Takeuchi\NcProgram\O100.txt` → 記 mtime / size / hash
-2. Scan 該機台今天 TX1.Log 找新 LoadProgram O100.txt 事件 → 記 tx1_event_ts
-3. CSV 輸出 `tools/probe_results/o100_smb_latency_{start_ts}.csv`，欄位含 `latency_secs = smb_mtime - tx1_event_ts`
+**Probe 部署紀錄：**
+- 2026-05-03 15:18:21 → 2026-05-04 08:48:05（17.5h）
+- M13-M18，每 30s poll
+- 12,694 筆 CSV row → `original_logs/verify/o100_smb_latency_20260503_151821.csv`
 
-**部署指令（production Windows）：**
-```cmd
-cd C:\DrillMonitor
-python tools\probe_o100_smb_latency.py
+**Layer 1 6 個問題的答案：**
+
+| Q | 問題 | 答案 |
+|---|------|------|
+| Q1 | SMB mtime 是否 lazy？ | **❌ 不 lazy**（TZ 修正後 median delta -0.1s, max ~3min） |
+| Q2 | O100.txt 變更頻率 | 每天 5-13 次，間隔以小時計 |
+| Q3 | 每次 LOAD 真的改內容？ | ✅ 100%（M14: 10/10、M15: 5/5、M18: 2/2 都改）|
+| Q4 | 有 SMB 變但無 TX1 LOAD 事件？ | ✅ 平均 50%（M14 23%、M15 50%、M18 71%、M16/17 100%）— 操作員多次儲存才 LOAD |
+| Q5 | M14 FILE.Log dump = live？ | ✅ 5/3 已用本機 sample 驗證（hash 一致） |
+| Q6 | LOAD 事件鬆緊 | 17.5h 內每台 0-10 次，差異大 |
+
+**重大意外發現（Layer 1 之外）：**
+
+#### 🔴 #1 — TZ 不一致（per-machine 設定）
+
+```
+M14 TX1 event: 17:54:40   ← JST (UTC+9)
+M14 SMB mtime: 16:54:40   ← TST (UTC+8)         差 +1h
+
+M13 TX1 event: 17:46:29   ← TST (UTC+8)
+M13 SMB mtime: 17:46:29   ← TST (UTC+8)         差 0
 ```
 
-**判讀：**
-- `latency_secs ≈ 0` 或負（TX1 領先<5s）→ SMB mtime 即時，可信賴 → M13-style 直接讀 SMB OK
-- `latency_secs > 60s` → SMB lazy mtime 嚴重 → 必須加 hash polling fallback（在 parser 觸發 SMB read 時，先 stat 看 mtime；若還沒更新到事件之後，再等 N 秒重讀，直到 hash 變）
+| 機台 | TX1 timezone | 修正方式 |
+|------|--------------|---------|
+| M13 | TST (UTC+8) | 不修正 |
+| M14, M15, M18 | JST (UTC+9) | TX1 ts -1h |
+| M16, M17 | window 內無事件，未確定 | 待累積 |
 
-**SMB 路徑可調：** 用 `--smb-template` 改路徑（預設 `\\{ip}\LOG\Takeuchi\NcProgram\O100.txt`），如果實際 share 結構不同需校正。
+→ **Phase 3 必須加 per-machine TZ 表**，否則時間錯位 1h（影響跨表 join）。
+
+#### 🔴 #2 — 50% 編輯沒有 TX1 LOAD 事件（孤兒編輯）
+
+操作員編輯 O100.txt 的典型 pattern：「儲存 → 再編 → 再儲存 → 最終 LOAD」。中間每次儲存都 mtime 更新但沒 TX1 事件。
+
+→ **Phase 3 不能只 hook TX1 事件**，必須加 SMB mtime 週期性 backstop polling。
+
+#### 🔴 #3 — 5/4 凌晨 TX1.Log 找到 4/4 的內容（資料源異常）
+
+```
+M13 obs_at=05/04 00:01:13  tx1_event=04/04 08:31:25  ← 一個月前的事件
+... 共 17 筆同類異常（M16: 17, M17: 12, M18: 26 都有）
+```
+
+probe 在 5/4 00:01 切到 `M13/20260504/04TX1.Log` 路徑，內容卻是 4/4 的 events。可能：
+- LOG collector 月份輪替時保留舊檔
+- robocopy 沒清上月同名檔
+- 路徑命名 collision（每月都有 day-04）
+
+**已在 analyzer 內過濾**。但 LOG collector 的 monthly rollover 行為值得獨立查一下。
+
+**SMB 路徑（5/3 修正）：** 預設 `\\{ip}\NcProgram\O100.txt`（NcProgram 是獨立 share，**不在** LOG share 下面）。
 
 ### Phase 3 prep：18 機台 FILE.Log 行為分類 ✅ probe 完成（待部署）
 
