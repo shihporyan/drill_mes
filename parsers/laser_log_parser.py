@@ -831,14 +831,25 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
                      "RUN", "RESET", None, None, None),
                 )
 
-        # UPSERT laser_work_orders
+        # UPSERT laser_work_orders — only records owned by today's parse.
+        # ProcTimeEnd files retain weeks of historical batches; without this
+        # filter every cycle re-UPSERTs every old record with a hole_count
+        # recomputed against today's events_window (today ± 1 day), wiping
+        # previously-correct counts. A WO is owned by the date its start_time
+        # falls on; cross-midnight WOs are picked up on their start day.
+        target_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
         for rec in unique_wo:
             # Convert timestamps to ISO format
             try:
                 start_dt = datetime.datetime.strptime(rec["start_time"], "%Y/%m/%d %H:%M:%S")
                 start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
             except ValueError:
-                start_iso = rec["start_time"]
+                # If start_time is unparseable we cannot decide ownership;
+                # skip rather than risk wiping a historical row.
+                continue
+
+            if start_dt.date() != target_date:
+                continue
 
             try:
                 end_dt = datetime.datetime.strptime(rec["end_time"], "%Y/%m/%d %H:%M:%S")
