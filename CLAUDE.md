@@ -71,3 +71,4 @@ npm run test:e2e:ui
 - [notes/smb_stale_session_after_power_loss.md](notes/smb_stale_session_after_power_loss.md) — 5/7 跳電後 M01/M13/M14 SMB session 壞掉事件：症狀、根因、永久修法
 - [notes/parser_cycle_15min_hang_20260504.md](notes/parser_cycle_15min_hang_20260504.md) — 5/4 cycle 跑 944s 導致 API connection refused：根因分析、WinError 10053 是症狀、5/8 加 per-step 耗時 log + WAL 保險
 - [notes/dashboard_lan_rebind_20260508.md](notes/dashboard_lan_rebind_20260508.md) — 5/8 下午 dashboard 從 NIC1 改綁 NIC2 (192.168.2.50:8080)，含 caveat（沒 NSSM、沒 IP whitelist）+ 驗收 checklist
+- [notes/health_check_20260509.md](notes/health_check_20260509.md) — 5/9 大健檢報告：5 天試跑稽核 5 維度；三大介面數字可信、4 筆 phantom 孔數需洗、6 台 TZ 設定錯、5/8 全廠 26% 待確認假日、weekend pattern 改變
