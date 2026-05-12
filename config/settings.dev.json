@@ -7,5 +7,12 @@
   "http_host": "127.0.0.1",
   "http_port": 8080,
   "utilization_target": 75,
-  "log_file": "drill_monitor_dev.log"
+  "log_file": "drill_monitor_dev.log",
+  "mes_push": {
+    "url": "http://127.0.0.1:18081",
+    "token_file": "dev_logs/mes_token.txt",
+    "snapshot_dir": "dev_logs/mes_snapshots",
+    "keep_snapshots": 3,
+    "timeout_seconds": 120
+  }
 }

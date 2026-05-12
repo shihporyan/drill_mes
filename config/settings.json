@@ -7,5 +7,12 @@
   "http_host": "TODO_OFFICE_NIC_IP",
   "http_port": 8080,
   "utilization_target": 75,
-  "log_file": "drill_monitor.log"
+  "log_file": "drill_monitor.log",
+  "mes_push": {
+    "url": "http://192.168.2.211:8081",
+    "token_file": "C:\\drill_push\\token.txt",
+    "snapshot_dir": "C:\\drill_push\\snapshots",
+    "keep_snapshots": 3,
+    "timeout_seconds": 120
+  }
 }

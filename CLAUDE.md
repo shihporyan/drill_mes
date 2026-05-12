@@ -72,3 +72,6 @@ npm run test:e2e:ui
 - [notes/parser_cycle_15min_hang_20260504.md](notes/parser_cycle_15min_hang_20260504.md) — 5/4 cycle 跑 944s 導致 API connection refused：根因分析、WinError 10053 是症狀、5/8 加 per-step 耗時 log + WAL 保險
 - [notes/dashboard_lan_rebind_20260508.md](notes/dashboard_lan_rebind_20260508.md) — 5/8 下午 dashboard 從 NIC1 改綁 NIC2 (192.168.2.50:8080)，含 caveat（沒 NSSM、沒 IP whitelist）+ 驗收 checklist
 - [notes/health_check_20260509.md](notes/health_check_20260509.md) — 5/9 大健檢報告：5 天試跑稽核 5 維度；三大介面數字可信、4 筆 phantom 孔數需洗、6 台 TZ 設定錯、5/8 全廠 26% 待確認假日、weekend pattern 改變
+- [notes/mes_integration_plan.md](notes/mes_integration_plan.md) — 5/11 MES × 鑽孔監控資料整合規劃：採方案 A 每日 snapshot push、計算在 MES 端、機鑽 work_orders 表是最大 blocker、併版處理待老闆決策
+- [notes/drill_push_dev_spec.md](notes/drill_push_dev_spec.md) — MES 端 receiver HTTP API spec（port 8081、token、IP 白名單、錯誤碼表）
+- [notes/mes_side_handoff.md](notes/mes_side_handoff.md) — **給 MES 端的使用說明**：snapshot 怎麼讀、schema、JOIN 策略、9 個資料品質警示（O100 孤兒 60%、TZ per-machine、機台時鐘漂移、TX1 flush latency、併版攤分、hole_count 小時 bucket 等）
