@@ -145,6 +145,74 @@ def find_log_file(log_dir, date_str, component):
     return None
 
 
+def _today_has_hole_events(plc_path):
+    """Return True if today's ClsPLCTrd has at least one BEAM_HOLE event.
+
+    Used to corroborate cross-day RUN carryover: an unclosed RUN_START on a
+    previous day could be a stale artifact (power loss truncated the log),
+    so we require positive evidence of actual drilling today before forcing
+    state=RUN. Stops scanning at the first match — early exit is cheap on
+    today-only files. Returns False on missing path / read errors so the
+    cross-day override fails closed.
+    """
+    if not plc_path or not os.path.exists(plc_path):
+        return False
+    try:
+        with open(plc_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if BEAM_HOLE_PATTERN.match(line):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def find_active_cross_day_run_start(backup_root, machine_id, today_date, max_lookback_days=7):
+    """Walk previous days' ClsLaserCom files to find an unclosed AUTO_RUN_START
+    that is still active on `today_date`.
+
+    Symmetric counterpart to the existing leading_orphan_del carryover: that one
+    handles "yesterday RUN ended early today", this one handles "yesterday RUN
+    is still going today". A multi-day batch produces ClsLaserCom files with
+    *no* AUTO_RUN events at all on the middle days — so we must walk back
+    until we find the day that contains the original RUN_START.
+
+    Stops walking at:
+      - a day whose ClsLaserCom file ends with a closed interval (last RUN
+        terminated → no carryover)
+      - a day whose ClsLaserCom has only an orphan RUN_END (RUN ended that day)
+      - a missing log directory
+      - max_lookback_days reached (safety bound; longest observed batch < 2d)
+
+    Returns:
+        datetime of the original RUN_START, or None if no carryover.
+    """
+    walk_date = today_date - datetime.timedelta(days=1)
+    for _ in range(max_lookback_days):
+        walk_str = walk_date.strftime("%Y%m%d")
+        walk_dir = os.path.join(backup_root, machine_id, walk_str)
+        walk_file = find_log_file(walk_dir, walk_str, "ClsLaserCom")
+        if not walk_file:
+            return None
+        intervals, leading_del = parse_cls_laser_com(walk_file)
+        if intervals:
+            last_start, last_end = intervals[-1]
+            if last_end is None:
+                # Unclosed AUTO_RUN_START at file tail — this is the original
+                # start of the still-active batch.
+                return last_start
+            # Last interval closed → RUN ended that day, no carryover.
+            return None
+        # No matched intervals on this day. A leading orphan DEL means RUN
+        # closed on this day (yesterday-of-this-day's RUN ended here), so no
+        # carryover. Otherwise this is a middle-of-batch day with zero
+        # AUTO_RUN events — keep walking back.
+        if leading_del is not None:
+            return None
+        walk_date -= datetime.timedelta(days=1)
+    return None
+
+
 # =============================================================================
 # A. Utilization: ClsLaserCom + PhysicalMemory
 # =============================================================================
@@ -674,10 +742,44 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
             leading_orphan_del.strftime("%H:%M:%S"),
         )
 
+    # Symmetric cross-midnight case: yesterday's RUN is *still* going today
+    # (today's ClsLaserCom has zero AUTO_RUN events). Without this, today gets
+    # 0 RUN seconds and state flips to RESET silently. We only trust the
+    # carryover if today's PLC log also shows actual hole-drilling events —
+    # absent that corroboration, the cross-day evidence may be stale (power
+    # loss truncated yesterday's log) and the machine is genuinely idle.
+    # compute_hourly_utilization clips intervals to today's pm_first/pm_last
+    # range, so a yesterday-anchored start is safe.
+    cross_day_run_start = None
+    if (
+        not run_intervals
+        and leading_orphan_del is None
+        and pm_first is not None
+    ):
+        today_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+        candidate_start = find_active_cross_day_run_start(
+            backup_root, machine_id, today_date,
+        )
+        if candidate_start is not None and _today_has_hole_events(plc_path):
+            cross_day_run_start = candidate_start
+            run_intervals.append((cross_day_run_start, None))
+            logger.info(
+                "[%s] Cross-midnight RUN still active: original start %s "
+                "(no AUTO_RUN events in today's log; PLC hole events confirm)",
+                machine_id, cross_day_run_start.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
     hourly = compute_hourly_utilization(run_intervals, pm_first, pm_last)
 
     # B. Detect current state
     state, since = detect_current_state(laser_com_path, plc_path, pm_first, pm_last)
+
+    # Override when we positively know yesterday's RUN is still open: today's
+    # ClsLaserCom is blind to RUN_START events emitted on a prior day, so
+    # detect_current_state would otherwise fall back to RESET/pm_last.
+    if cross_day_run_start is not None:
+        state = "RUN"
+        since = cross_day_run_start.strftime("%Y-%m-%dT%H:%M:%S")
 
     # C. Parse work orders. Track ProcTimeEnd (historical, completed batches)
     # and ProcTimeStart (the *current* batch from operator panel) separately:
@@ -813,16 +915,20 @@ def parse_laser_machine(db_path, machine_id, log_dir, programs_dir, date_str, ba
              None, last_wo, None),
         )
 
-        # Insert state transitions from RUN intervals
+        # Insert state transitions from RUN intervals. Always write the
+        # RESET->RUN start, even when end is None (open interval / still
+        # running) — otherwise compute_effective_since on the dashboard
+        # walks back through state_transitions and misses the real start of
+        # a multi-day batch, displaying days of phantom idle time.
         for start, end in run_intervals:
+            conn.execute(
+                "INSERT OR IGNORE INTO state_transitions "
+                "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (machine_id, start.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "RESET", "RUN", None, None, None),
+            )
             if end is not None:
-                conn.execute(
-                    "INSERT OR IGNORE INTO state_transitions "
-                    "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (machine_id, start.strftime("%Y-%m-%dT%H:%M:%S"),
-                     "RESET", "RUN", None, None, None),
-                )
                 conn.execute(
                     "INSERT OR IGNORE INTO state_transitions "
                     "(machine_id, timestamp, from_state, to_state, program, tool_num, drill_dia) "
