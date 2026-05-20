@@ -262,25 +262,28 @@ function OverviewTab({data}) {
                     <span style={{fontSize:15,fontWeight:800}}>{m.id}</span>
                     <span style={{fontSize:12,fontWeight:600,background:"rgba(255,255,255,0.2)",padding:"2px 10px",borderRadius:20}}>{s.label}</span>
                   </div>
-                  <div style={{padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <div>
-                      <div style={{fontSize:11,color:"#9ca3af"}}>{displayState==="OFFLINE"?"離線時間":"持續時間"}</div>
-                      <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>{durStr(m.duration_minutes||0)}</div>
-                    </div>
-                    {isIdleTooLong ? (
-                      <div style={{fontSize:11,fontWeight:600,color:"#dc2626",background:"#fef2f2",padding:"3px 8px",borderRadius:4}}>⚠ 閒置過久</div>
-                    ) : displayState==="RUN" && m.work_order ? (
-                      <div style={{textAlign:"right"}}>
-                        <div style={{fontSize:10,color:"#9ca3af"}}>工號</div>
-                        <div style={{fontSize:12,fontWeight:600,color:"#374151"}}>{m.work_order}{m.work_order_side ? `.${m.work_order_side}` : ""}</div>
-                        {m.type === "takeuchi" && Array.isArray(m.current_o100_subs) && m.current_o100_subs.length > 0 && (
-                          <div title={m.o100_captured_at ? `O100 更新: ${m.o100_captured_at}` : ""}
-                               style={{fontSize:10,color:"#6b7280",fontFamily:"ui-monospace, monospace",marginTop:1}}>
-                            [{m.current_o100_subs.join(",")}]
-                          </div>
-                        )}
+                  <div style={{padding:"10px 14px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div>
+                        <div style={{fontSize:11,color:"#9ca3af"}}>{displayState==="OFFLINE"?"離線時間":"持續時間"}</div>
+                        <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>{durStr(m.duration_minutes||0)}</div>
                       </div>
-                    ) : null}
+                      {isIdleTooLong ? (
+                        <div style={{fontSize:11,fontWeight:600,color:"#dc2626",background:"#fef2f2",padding:"3px 8px",borderRadius:4}}>⚠ 閒置過久</div>
+                      ) : displayState==="RUN" && m.work_order ? (
+                        <div style={{textAlign:"right"}}>
+                          <div style={{fontSize:10,color:"#9ca3af"}}>工號</div>
+                          <div style={{fontSize:12,fontWeight:600,color:"#374151"}}>{m.work_order}{m.work_order_side ? `.${m.work_order_side}` : ""}</div>
+                        </div>
+                      ) : null}
+                    </div>
+                    {displayState==="RUN" && m.type === "takeuchi" && Array.isArray(m.current_o100_subs) && m.current_o100_subs.length > 0 && (
+                      <div title={m.o100_captured_at ? `O100 更新: ${m.o100_captured_at}` : ""}
+                           style={{marginTop:8,paddingTop:6,borderTop:"1px dashed #f3f4f6",fontSize:10,color:"#6b7280",fontFamily:"ui-monospace, monospace",wordBreak:"break-all",lineHeight:1.4}}>
+                        <span style={{color:"#9ca3af",fontFamily:"'Noto Sans TC',sans-serif",marginRight:4}}>板別</span>
+                        [{[...m.current_o100_subs].sort((a,b)=>Number(a)-Number(b)).join(",")}]
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -380,7 +383,7 @@ function RankingTab({overviewData}) {
   const [selectedWeek, setSelectedWeek] = useState(null);
   const [loading, setLoading] = useState(true);
   const [kpiFilter, setKpiFilter] = useState("all");
-  const [includeWeekends, setIncludeWeekends] = useState(false);
+  const [includeWeekends, setIncludeWeekends] = useState(true);
 
   const fetchTrends = (level, params, includeWE) => {
     // Use the explicit includeWE if passed (for the toggle handler that needs
@@ -551,7 +554,7 @@ function RankingTab({overviewData}) {
             </div>
           </div>
         </>)}
-        <button onClick={toggleWeekends} title="切換是否把 Sat / Sun 計入稼動率（預設不計，反映正常工作日表現）" style={{
+        <button onClick={toggleWeekends} title="切換是否把 Sat / Sun 計入稼動率（預設計入，反映全年稼動）" style={{
           marginLeft:"auto",
           fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,
           border:"1.5px solid",cursor:"pointer",
@@ -626,8 +629,8 @@ function AnalysisTab({overviewData}) {
   const [hoveredCell, setHoveredCell] = useState(null);
   const [filter, setFilter] = useState("all");
   const [range, setRange] = useState("day");
-  const [rankPeriod, setRankPeriod] = useState("month");
-  const [includeWeekends, setIncludeWeekends] = useState(false);
+  const [rankPeriod, setRankPeriod] = useState("day");
+  const [includeWeekends, setIncludeWeekends] = useState(true);
   const today = new Date().toISOString().slice(0,10);
   const shiftW = 48;
 
@@ -690,11 +693,16 @@ function AnalysisTab({overviewData}) {
   const drillHeat = machinesWithCells.filter(m => getMachineType(m.id, ovMachines) === "takeuchi");
   const laserHeat = machinesWithCells.filter(m => getMachineType(m.id, ovMachines) === "kataoka");
 
-  const avgOf = sel => machinesWithCells.length ? Math.round(machinesWithCells.reduce((s,m)=>s+sel(m),0)/machinesWithCells.length) : 0;
-  const oDay   = avgOf(m => m.shifts.day);
-  const oMid   = avgOf(m => m.shifts.mid);
-  const oNight = avgOf(m => m.shifts.night);
-  const shiftSpread = Math.max(oDay,oMid,oNight) - Math.min(oDay,oMid,oNight);
+  const avgBy = (arr, sel) => arr.length ? Math.round(arr.reduce((s,m)=>s+sel(m),0)/arr.length) : 0;
+  const shiftAvg = arr => {
+    const day = avgBy(arr, m => m.shifts.day);
+    const mid = avgBy(arr, m => m.shifts.mid);
+    const night = avgBy(arr, m => m.shifts.night);
+    const spread = arr.length ? Math.max(day,mid,night) - Math.min(day,mid,night) : 0;
+    return {day, mid, night, spread};
+  };
+  const drillShiftAvg = shiftAvg(drillHeat);
+  const laserShiftAvg = shiftAvg(laserHeat);
 
   // Machine ranking — period (day/week/month) is user-selectable so 排班 / 月度
   // / 日對比 can all use this same row.
@@ -770,7 +778,7 @@ function AnalysisTab({overviewData}) {
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,gap:12,flexWrap:"wrap"}}>
             <div style={{fontSize:13,fontWeight:600,color:"#374151"}}>各機台稼動率排行（{rankPeriodLabel}）</div>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <button onClick={()=>setIncludeWeekends(!includeWeekends)} title="切換是否把 Sat / Sun 計入。預設不計（反映平日表現）；開啟後可看出週末加班情形" style={{
+              <button onClick={()=>setIncludeWeekends(!includeWeekends)} title="切換是否把 Sat / Sun 計入。預設計入（反映全年稼動）；關閉後僅顯示平日表現" style={{
                 fontSize:11,fontWeight:600,padding:"5px 10px",borderRadius:6,
                 border:"1.5px solid",cursor:"pointer",
                 background: includeWeekends?"#fef3c7":"#fff",
@@ -826,19 +834,31 @@ function AnalysisTab({overviewData}) {
         </div>
       )}
 
-      <div style={{display:"flex",gap:12,marginBottom:16}}>
-        {[
-          {label:"日班 07:30–16:30",val:`${oDay}%`,  color:oDay>=TARGET?"#059669":"#d97706",       bg:"#f0fdf4", border:"#bbf7d0"},
-          {label:"中班 15:00–24:00",val:`${oMid}%`,  color:oMid>=TARGET?"#059669":"#d97706",       bg:"#fff7ed", border:"#fed7aa"},
-          {label:"夜班 23:30–08:00",val:`${oNight}%`,color:oNight>=TARGET?"#059669":oNight>=40?"#d97706":"#dc2626", bg:"#eef2ff", border:"#c7d2fe"},
-          {label:"班次落差",val:`${shiftSpread}%`,color:shiftSpread>=20?"#dc2626":"#d97706", bg:"#fef2f2", border:"#fecaca"},
-        ].map((c,i)=>(
-          <div key={i} style={{flex:1,background:c.bg,borderRadius:10,padding:"10px 14px",border:`1px solid ${c.border}`}}>
-            <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>{c.label}</div>
-            <div style={{fontSize:24,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</div>
+      {[
+        {typeLabel:"機鑽 Takeuchi", typeColor:COLOR_DRILL, avg:drillShiftAvg, count:drillHeat.length},
+        ...(laserHeat.length > 0 ? [{typeLabel:"雷鑽 Kataoka", typeColor:COLOR_LASER, avg:laserShiftAvg, count:laserHeat.length}] : []),
+      ].map((row,ri)=>(
+        <div key={ri} style={{display:"flex",gap:12,marginBottom:ri===0?8:16,alignItems:"stretch"}}>
+          <div style={{width:120,display:"flex",alignItems:"center",gap:6,paddingLeft:2,flexShrink:0}}>
+            <div style={{width:4,height:24,borderRadius:2,background:row.typeColor}}/>
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:"#374151",lineHeight:1.2}}>{row.typeLabel}</div>
+              <div style={{fontSize:10,color:"#9ca3af",lineHeight:1.2}}>{row.count} 台平均</div>
+            </div>
           </div>
-        ))}
-      </div>
+          {[
+            {label:"日班 07:30–16:30",val:`${row.avg.day}%`,  color:row.avg.day>=TARGET?"#059669":"#d97706",  bg:"#f0fdf4", border:"#bbf7d0"},
+            {label:"中班 15:00–24:00",val:`${row.avg.mid}%`,  color:row.avg.mid>=TARGET?"#059669":"#d97706",  bg:"#fff7ed", border:"#fed7aa"},
+            {label:"夜班 23:30–08:00",val:`${row.avg.night}%`,color:row.avg.night>=TARGET?"#059669":row.avg.night>=40?"#d97706":"#dc2626", bg:"#eef2ff", border:"#c7d2fe"},
+            {label:"班次落差",val:`${row.avg.spread}%`,color:row.avg.spread>=20?"#dc2626":"#d97706", bg:"#fef2f2", border:"#fecaca"},
+          ].map((c,i)=>(
+            <div key={i} style={{flex:1,background:c.bg,borderRadius:10,padding:"10px 14px",border:`1px solid ${c.border}`}}>
+              <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>{c.label}</div>
+              <div style={{fontSize:24,fontWeight:800,color:c.color,lineHeight:1}}>{c.val}</div>
+            </div>
+          ))}
+        </div>
+      ))}
 
       <div style={{background:"#fff",borderRadius:10,border:"1px solid #e5e7eb",padding:"16px 20px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,gap:12,flexWrap:"wrap"}}>
