@@ -181,8 +181,17 @@ def find_active_cross_day_run_start(backup_root, machine_id, today_date, max_loo
       - a day whose ClsLaserCom file ends with a closed interval (last RUN
         terminated → no carryover)
       - a day whose ClsLaserCom has only an orphan RUN_END (RUN ended that day)
-      - a missing log directory
+      - a day with neither ClsLaserCom nor PhysicalMemory (machine was down,
+        so the RUN could not have spanned it)
       - max_lookback_days reached (safety bound; longest observed batch < 2d)
+
+    A middle-of-batch day for a continuously-running machine emits *no*
+    AUTO_RUN events, so the controller may not write a ClsLaserCom for that
+    day at all. A missing ClsLaserCom is therefore treated as "empty, keep
+    walking" — but only when a PhysicalMemory heartbeat confirms the machine
+    was alive that day. Without that guard a multi-day RUN whose middle day
+    has no ClsLaserCom file (the L4 5/18→5/20 case) would wrongly stop at the
+    gap and report idle.
 
     Returns:
         datetime of the original RUN_START, or None if no carryover.
@@ -193,6 +202,13 @@ def find_active_cross_day_run_start(backup_root, machine_id, today_date, max_loo
         walk_dir = os.path.join(backup_root, machine_id, walk_str)
         walk_file = find_log_file(walk_dir, walk_str, "ClsLaserCom")
         if not walk_file:
+            # No ClsLaserCom this day. If the machine was alive (PhysicalMemory
+            # heartbeat present) it was a silent middle-of-batch day — keep
+            # walking. If no heartbeat either, the machine was down and the RUN
+            # cannot have spanned this day, so stop.
+            if find_log_file(walk_dir, walk_str, "PhysicalMemory"):
+                walk_date -= datetime.timedelta(days=1)
+                continue
             return None
         intervals, leading_del = parse_cls_laser_com(walk_file)
         if intervals:
